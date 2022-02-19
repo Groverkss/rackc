@@ -11,7 +11,7 @@
 (define ast (read-program file))
 
 (define (opt passes ast)
-  (println ast)
+  (pretty-print ast)
   (match passes
     ['() ast]
     [(list (list name fun interp) more ...)
