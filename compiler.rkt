@@ -4,6 +4,7 @@
 (require "interp-Lint.rkt")
 (require "interp-Lvar.rkt")
 (require "interp-Cvar.rkt")
+(require "interp.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
 
@@ -176,9 +177,57 @@
     [(Program info body)
      (CProgram info (list (cons 'start (explicate-tail body))))]))
 
+(define (select-atm atm)
+  (match atm
+    [(Var x) (Var x)]
+    [(Int n) (Imm n)]))
+
+(define (get-op-name prim)
+  (match prim
+    [(Prim '+ (list e1 e2)) 'addq]
+    [(Prim '- (list e1 e2)) 'subq]
+    [(Prim '- (list e1)) 'negq]))
+
+(define (select-assign x e)
+  (match e
+    ; movq e, x
+    [atm #:when (atm? atm)
+         (list (Instr 'movq (list (select-atm atm) x)))]
+    ; op x because e1 = x
+    [(Prim op (list e1)) #:when (equal? e1 x)
+                         (list (Instr (get-op-name e) (list (select-atm x))))]
+    ; movq e1, x ; op x
+    [(Prim op (list e1))
+     (list
+      (Instr 'movq (list (select-atm e1) x))
+      (Instr (get-op-name e) (list (select-atm x))))]
+    ; ; op e2 x because e1 = x
+    [(Prim op (list e1 e2)) #:when (equal? e1 x)
+                            (list (Instr
+                                   (get-op-name e)
+                                   (list (select-atm e2) x)))]
+    ; movq e1, x ; op e2, x
+    [(Prim op (list e1 e2))
+     (list
+      (Instr 'movq (list (select-atm e1) x))
+      (Instr (get-op-name e) (list (select-atm e2) x)))]))
+
+(define (select-stmt stmt)
+  (match stmt
+    [(Return e) (select-assign (Reg 'rax) e)]
+    [(Assign x e) (select-assign x e)]))
+
+(define (select-tail t)
+  (match t
+    [(Return x) (append (select-stmt t) (list (Jmp 'conclusion)))]
+    [(Seq assign tail) (append (select-stmt assign) (select-tail tail))]
+    [else (error "select-tail unhandled case")]))
+
 ;; select-instructions : C0 -> pseudo-x86
 (define (select-instructions p)
-  (error "TODO: code goes here (select-instructions)"))
+  (match p
+    [(CProgram info (list (cons 'start t)))
+     (X86Program info (list (cons 'start (Block '() (select-tail t)))))]))
 
 ;; assign-homes : pseudo-x86 -> pseudo-x86
 (define (assign-homes p)
@@ -199,7 +248,7 @@
   `( ("uniquify" ,uniquify ,interp-Lvar)
      ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
      ("explicate control" ,explicate-control ,interp-Cvar)
-     ;; ("instruction selection" ,select-instructions ,interp-x86-0)
+     ("instruction selection" ,select-instructions ,interp-x86-0)
      ;; ("assign homes" ,assign-homes ,interp-x86-0)
      ;; ("patch instructions" ,patch-instructions ,interp-x86-0)
      ;; ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
