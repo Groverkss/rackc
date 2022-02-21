@@ -10,6 +10,8 @@
 (define file (command-line #:args (filename) filename))
 (define ast (read-program file))
 
+(AST-output-syntax 'concrete-syntax)
+
 (define (opt passes ast)
   (pretty-print ast)
   (match passes
