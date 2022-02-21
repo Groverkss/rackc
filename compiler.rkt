@@ -3,6 +3,7 @@
 (require racket/fixnum)
 (require "interp-Lint.rkt")
 (require "interp-Lvar.rkt")
+(require "interp-Cvar.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
 
@@ -59,9 +60,9 @@
       [(Let x e body)
        (let ([new-env (dict-set env x (gensym x))])
          (Let
-           (dict-ref new-env x)
-           ((uniquify-exp new-env) e)
-           ((uniquify-exp new-env) body)))]
+          (dict-ref new-env x)
+          ((uniquify-exp new-env) e)
+          ((uniquify-exp new-env) body)))]
       [(Prim op es)
        (Prim op (for/list ([e es]) ((uniquify-exp env) e)))])))
 
@@ -70,13 +71,110 @@
   (match p
     [(Program info e) (Program info ((uniquify-exp '()) e))]))
 
-;; remove-complex-opera* : R1 -> R1
+; (define (remove-complex-expr env expr)
+;   (lambda (e)
+;     (match e
+;       [(Int n) (Int n)]
+;       [(Var x) (Var x)]
+;       [(Let x e body)
+;        (Let x
+;             (remove-complex-expr env expr)
+;             (remove-complex-expr env expr))]
+;       [(Prim op es) ()])))
+
+; (define (rce-atom ast)
+;   (match ast
+;     ))
+
+; Given a list of expressions, build atoms from the and collect their
+; environment. Returns (list (list atoms), environment).
+(define (collect-env es)
+  (match es
+    ['() (list '() '())]
+    [(list ast rst ...)
+     (match (rco-atm ast)
+       [(list atm env)
+        (match (collect-env rst)
+          [(list atm-ret env-ret)
+           (list
+            (cons atm atm-ret)
+            (append env env-ret))])])]))
+
+(define (create-tmp-var)
+  (gensym "tmp"))
+
+; Given a AST, convert it into an atom.
+; Returns (list atom environment)
+(define (rco-atm ast)
+  (match ast
+    [(Int n) (list (Int n) '())]
+    [(Var n) (list (Var n) '())]
+    ; Convert body to an atom and return that. Push this Let into the
+    ; environment. This Let must come before the inside environment to
+    ; preserve order of executation of statements.
+    [(Let x e body)
+     (match (rco-atm body)
+       [(list atm env)
+        (list atm (append (list (list x e) env)))])]
+    ; Convert each es to an atom and collect their environment into env
+    ; using collect-env. Now, create a new tmp variable, and assign it to
+    ; be result of Prim. tmp-var = (Prim op atm-list). The new Prim created
+    ; must come at end of environment to preserve order of execuation of
+    ; statements.
+    [(Prim op es)
+     (match (collect-env es)
+       [(list atm-list env)
+        (let ([tmp-var (create-tmp-var)])
+          (list
+           (Var tmp-var)
+           (append env (list (list tmp-var (Prim op atm-list))))))])]))
+
+(define (create-let-from-env env body)
+  (match env
+    ['() body]
+    [(list (list var e) more ...)
+     (Let var e (create-let-from-env more body))]))
+
+; Given a AST, remove complex expressions from it.
+; Returns an AST
+(define (rco-exp ast)
+  (match ast
+    [(Int n) (Int n)]
+    [(Var x) (Var x)]
+    [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
+    [(Prim 'read '()) (Prim 'read '())]
+    [(Prim op es)
+     (match (collect-env es)
+       [(list atm-list env)
+        (create-let-from-env env (Prim op atm-list))])]))
+
+; remove-complex-opera* : R1 -> R1
 (define (remove-complex-opera* p)
-  (error "TODO: code goes here (remove-complex-opera*)"))
+  (match p
+    [(Program info e) (Program info (rco-exp e))]))
+
+(define (explicate-tail e)
+  (match e
+    [(Var x) (Return (Var x))]
+    [(Int n) (Return (Int n))]
+    [(Let x rhs body) (explicate-assign rhs x (explicate-tail body))]
+    [(Prim op es) (Return (Prim op es))]
+    [else (error "explicate-tail unhandled case" e)]))
+
+(define (explicate-assign e x cont)
+  (match e
+    [(Var y) (Seq (Assign (Var x) (Var y)) cont)]
+    [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
+    [(Let y rhs body)
+     (explicate-assign rhs y (explicate-assign body x cont))]
+    [(Prim op es) (Seq (Assign (Var x) (Prim op es)) cont)]
+    [else (error "explicate-assign unhandled case" e)]))
 
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
-  (error "TODO: code goes here (explicate-control)"))
+  (match p
+    [(Program info body)
+     (CProgram info (list (cons 'start (explicate-tail body))))]))
 
 ;; select-instructions : C0 -> pseudo-x86
 (define (select-instructions p)
@@ -99,12 +197,10 @@
 ;; must be named "compiler.rkt"
 (define compiler-passes
   `( ("uniquify" ,uniquify ,interp-Lvar)
-     ;; Uncomment the following passes as you finish them.
-     ;; ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
-     ;; ("explicate control" ,explicate-control ,interp-Cvar)
+     ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
+     ("explicate control" ,explicate-control ,interp-Cvar)
      ;; ("instruction selection" ,select-instructions ,interp-x86-0)
      ;; ("assign homes" ,assign-homes ,interp-x86-0)
      ;; ("patch instructions" ,patch-instructions ,interp-x86-0)
      ;; ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
      ))
-
