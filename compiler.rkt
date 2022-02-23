@@ -72,21 +72,6 @@
   (match p
     [(Program info e) (Program info ((uniquify-exp '()) e))]))
 
-; (define (remove-complex-expr env expr)
-;   (lambda (e)
-;     (match e
-;       [(Int n) (Int n)]
-;       [(Var x) (Var x)]
-;       [(Let x e body)
-;        (Let x
-;             (remove-complex-expr env expr)
-;             (remove-complex-expr env expr))]
-;       [(Prim op es) ()])))
-
-; (define (rce-atom ast)
-;   (match ast
-;     ))
-
 ; Given a list of expressions, build atoms from the and collect their
 ; environment. Returns (list (list atoms), environment).
 (define (collect-env es)
@@ -229,17 +214,99 @@
     [(CProgram info (list (cons 'start t)))
      (X86Program info (list (cons 'start (Block '() (select-tail t)))))]))
 
+(define (get-next-stack-loc env)
+  (* (- 8) (+ (length env) 1)))
+
+; Returns new-arg, new-env
+(define (assign-arg arg env)
+  (match arg
+    [(Var x)
+     #:when (dict-has-key? env x)
+     (values (dict-ref env x) env)]
+    [(Var x)
+     (let ([curr (get-next-stack-loc env)])
+       (values
+        (Deref 'rbp curr)
+        (dict-set env x (Deref 'rbp curr))))]
+    [else (values arg env)]))
+
+; Returns new-args, new-env
+(define (assign-arg-list args env)
+  (match args
+    ['() (values '() env)]
+    [(list arg more ...)
+     (define-values
+       (tmp-arg tmp-env)
+       (assign-arg arg env))
+     (define-values
+       (new-args new-env)
+       (assign-arg-list more tmp-env))
+     (values (cons tmp-arg new-args) new-env)]))
+
+(define (assign-var-mapping instrs env)
+  (match instrs
+    ['() '()]
+    [(list (Instr name args) more ... )
+     (define-values
+       (new-args new-env)
+       (assign-arg-list args env))
+     (cons
+      (Instr name new-args)
+      (assign-var-mapping more new-env))]
+    [else (cons
+           (car instrs)
+           (assign-var-mapping (cdr instrs) env))]))
+
 ;; assign-homes : pseudo-x86 -> pseudo-x86
 (define (assign-homes p)
-  (error "TODO: code goes here (assign-homes)"))
+  (match p
+    [(X86Program info (list (cons 'start (Block blkinfo instrs))))
+     (let ([new-instrs (assign-var-mapping instrs '())])
+       (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
+
+(define (patch-instrs-list instrs)
+  (match instrs
+    ['() '()]
+    [(list (Instr op (list a b)) more ...)
+     #:when (and (Deref? a) (Deref? b))
+     (append
+      (list (Instr 'movq (list a (Reg 'rax))))
+      (list (Instr op (list (Reg 'rax) b)))
+      (patch-instrs-list more))]
+    [(list instr more ...)
+     (cons
+      instr
+      (patch-instrs-list more))]))
 
 ;; patch-instructions : psuedo-x86 -> x86
 (define (patch-instructions p)
-  (error "TODO: code goes here (patch-instructions)"))
+  (match p
+    [(X86Program info (list (cons 'start (Block blkinfo instrs))))
+     (let ([new-instrs (patch-instrs-list instrs)])
+       (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
+
+(define (generate-prelude)
+  (list (cons 'main (Block '()
+                     (list (Instr 'pushq (list (Reg 'rbp)))
+                           (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
+                           (Instr 'subq (list (Imm 16) (Reg 'rsp)))
+                           (Jmp 'start))))))
+
+(define (generate-conclusion)
+  (list (cons
+         'conclusion
+         (Block '()
+                (list (Instr 'addq (list (Imm 16) (Reg 'rsp)))
+                      (Instr 'popq (list (Reg 'rbp)))
+                      (Retq))))))
 
 ;; prelude-and-conclusion : x86 -> x86
 (define (prelude-and-conclusion p)
-  (error "TODO: code goes here (prelude-and-conclusion)"))
+  (match p
+    [(X86Program info blocks)
+     (X86Program info (append (generate-prelude)
+                              blocks
+                              (generate-conclusion)))]))
 
 ;; Define the compiler passes to be used by interp-tests and the grader
 ;; Note that your compiler file (the file that defines the passes)
@@ -249,7 +316,7 @@
      ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
      ("explicate control" ,explicate-control ,interp-Cvar)
      ("instruction selection" ,select-instructions ,interp-x86-0)
-     ;; ("assign homes" ,assign-homes ,interp-x86-0)
-     ;; ("patch instructions" ,patch-instructions ,interp-x86-0)
-     ;; ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+     ("assign homes" ,assign-homes ,interp-x86-0)
+     ("patch instructions" ,patch-instructions ,interp-x86-0)
+     ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
      ))
