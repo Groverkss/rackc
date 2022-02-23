@@ -285,6 +285,7 @@
      (let ([new-instrs (patch-instrs-list instrs)])
        (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
 
+; TODO: Fix stack frame size (Assumed to be 16?).
 (define (generate-prelude)
   (list (cons 'main (Block '()
                      (list (Instr 'pushq (list (Reg 'rbp)))
@@ -292,13 +293,14 @@
                            (Instr 'subq (list (Imm 16) (Reg 'rsp)))
                            (Jmp 'start))))))
 
+; TODO: Fix stack frame size (Assumed to be 16?).
 (define (generate-conclusion)
   (list (cons
-         'conclusion
-         (Block '()
-                (list (Instr 'addq (list (Imm 16) (Reg 'rsp)))
-                      (Instr 'popq (list (Reg 'rbp)))
-                      (Retq))))))
+          'conclusion
+          (Block '()
+                 (list (Instr 'addq (list (Imm 16) (Reg 'rsp)))
+                       (Instr 'popq (list (Reg 'rbp)))
+                       (Retq))))))
 
 ;; prelude-and-conclusion : x86 -> x86
 (define (prelude-and-conclusion p)
