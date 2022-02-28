@@ -62,7 +62,7 @@
        (let ([new-env (dict-set env x (gensym x))])
          (Let
           (dict-ref new-env x)
-          ((uniquify-exp new-env) e)
+          ((uniquify-exp env) e)
           ((uniquify-exp new-env) body)))]
       [(Prim op es)
        (Prim op (for/list ([e es]) ((uniquify-exp env) e)))])))
@@ -101,7 +101,7 @@
     [(Let x e body)
      (match (rco-atm body)
        [(list atm env)
-        (list atm (append (list (list x e) env)))])]
+        (list atm (append (list (list x (rco-exp e))) env))])]
     ; Convert each es to an atom and collect their environment into env
     ; using collect-env. Now, create a new tmp variable, and assign it to
     ; be result of Prim. tmp-var = (Prim op atm-list). The new Prim created
@@ -128,7 +128,6 @@
     [(Int n) (Int n)]
     [(Var x) (Var x)]
     [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
-    [(Prim 'read '()) (Prim 'read '())]
     [(Prim op es)
      (match (collect-env es)
        [(list atm-list env)
@@ -165,7 +164,8 @@
 (define (select-atm atm)
   (match atm
     [(Var x) (Var x)]
-    [(Int n) (Imm n)]))
+    [(Int n) (Imm n)]
+    [(Reg r) (Reg r)]))
 
 (define (get-op-name prim)
   (match prim
@@ -195,12 +195,18 @@
     [(Prim op (list e1 e2))
      (list
       (Instr 'movq (list (select-atm e1) x))
-      (Instr (get-op-name e) (list (select-atm e2) x)))]))
+      (Instr (get-op-name e) (list (select-atm e2) x)))]
+    [(Prim 'read '())
+      (list
+        (Callq 'read_int 0)
+        (Instr 'movq (list (Reg 'rax) x)))]
+    [else (error "select-assign unhandled case")]))
 
 (define (select-stmt stmt)
   (match stmt
     [(Return e) (select-assign (Reg 'rax) e)]
-    [(Assign x e) (select-assign x e)]))
+    [(Assign x e) (select-assign x e)]
+    [else (error "select-stmt unhandled case")]))
 
 (define (select-tail t)
   (match t
@@ -290,7 +296,7 @@
   (list (cons 'main (Block '()
                      (list (Instr 'pushq (list (Reg 'rbp)))
                            (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                           (Instr 'subq (list (Imm 16) (Reg 'rsp)))
+                           (Instr 'subq (list (Imm 16000) (Reg 'rsp)))
                            (Jmp 'start))))))
 
 ; TODO: Fix stack frame size (Assumed to be 16?).
@@ -298,7 +304,7 @@
   (list (cons
           'conclusion
           (Block '()
-                 (list (Instr 'addq (list (Imm 16) (Reg 'rsp)))
+                 (list (Instr 'addq (list (Imm 16000) (Reg 'rsp)))
                        (Instr 'popq (list (Reg 'rbp)))
                        (Retq))))))
 
@@ -314,7 +320,7 @@
 ;; Note that your compiler file (the file that defines the passes)
 ;; must be named "compiler.rkt"
 (define compiler-passes
-  `( ("uniquify" ,uniquify ,interp-Lvar)
+  `(("uniquify" ,uniquify ,interp-Lvar)
      ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
      ("explicate control" ,explicate-control ,interp-Cvar)
      ("instruction selection" ,select-instructions ,interp-x86-0)
