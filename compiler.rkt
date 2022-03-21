@@ -6,6 +6,7 @@
 (require "interp-Lvar.rkt")
 (require "interp-Cvar.rkt")
 (require "interp.rkt")
+(require "priority_queue.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
 
@@ -286,6 +287,15 @@
   (match instr
     ; Add edge between (d, v) \forall v \in L_after(k) | v != s or v != d
     [(Instr 'movq (list s d))
+     (add-vertex! graph d)
+     ; Add vertex s and d, just in case no edge is added.
+     (if (not (Imm? s))
+         (add-vertex! graph s)
+         void)
+     (if (not (Imm? d))
+         (add-vertex! graph d)
+         void)
+     ; Add edges
      (let* ([filtered_L (set-subtract L_afterk (set s d))])
        (add-interference filtered_L (set d) graph))]
     ; For any other instruction, (d, v) \forall d \in write(instr) v \in L_afterk | v != d
@@ -323,113 +333,186 @@
        (build-interference-blocks blocks (undirected-graph '())))
       blocks)]))
 
-(define (get-next-stack-loc env)
-  (* (- 8) (+ (length env) 1)))
+; TODO: Update priority of graph neighbours.
+(define (color-graph-update-queue graph queue v) queue)
 
-; Returns new-arg, new-env
-(define (assign-arg arg env)
-  (match arg
-    [(Var x)
-     #:when (dict-has-key? env x)
-     (values (dict-ref env x) env)]
-    [(Var x)
-     (let ([curr (get-next-stack-loc env)])
-       (values
-        (Deref 'rbp curr)
-        (dict-set env x (Deref 'rbp curr))))]
-    [else (values arg env)]))
+; Given a set of colors, find the MEX starting from 0.
+(define (get-mex-color s)
+  (define (get-mex-color-start s t)
+    (if
+     (set-member? s t)
+     (get-mex-color-start s (+ t 1))
+     t))
+  (get-mex-color-start s 0))
 
-; Returns new-args, new-env
-(define (assign-arg-list args env)
-  (match args
-    ['() (values '() env)]
-    [(list arg more ...)
-     (define-values
-       (tmp-arg tmp-env)
-       (assign-arg arg env))
-     (define-values
-       (new-args new-env)
-       (assign-arg-list more tmp-env))
-     (values (cons tmp-arg new-args) new-env)]))
+; Returns -1 for unassigned neighbors. This doesn't affect
+; algorithm since we take MEX from 0.
+(define (get-neighbor-colors graph current-mapping v)
+  (for/set ([n (in-neighbors graph v)])
+    (if (dict-has-key? current-mapping n)
+        (dict-ref current-mapping n)
+        -1)))
 
-(define (assign-var-mapping instrs env)
-  (match instrs
-    ['() '()]
-    [(list (Instr name args) more ... )
-     (define-values
-       (new-args new-env)
-       (assign-arg-list args env))
-     (cons
-      (Instr name new-args)
-      (assign-var-mapping more new-env))]
-    [else (cons
-           (car instrs)
-           (assign-var-mapping (cdr instrs) env))]))
+(define (color-graph-update-mapping graph current-mapping v)
+  (dict-set
+   current-mapping
+   v
+   (get-mex-color (get-neighbor-colors graph current-mapping v))))
 
-;; assign-homes : pseudo-x86 -> pseudo-x86
-(define (assign-homes p)
-  (match p
-    [(X86Program info (list (cons 'start (Block blkinfo instrs))))
-     (let ([new-instrs (assign-var-mapping instrs '())])
-       (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
+(define (color-graph-recurse graph queue current-mapping)
+  (if
+   (= (pqueue-count queue) 0)
+   current-mapping
+   (let ([v (vector-ref (pqueue-pop! queue) 0)])
+     (color-graph-recurse
+      graph
+      (color-graph-update-queue graph queue v)
+      (color-graph-update-mapping graph current-mapping v)))))
 
-(define (patch-instrs-list instrs)
-  (match instrs
-    ['() '()]
-    [(list (Instr op (list a b)) more ...)
-     #:when (and (Deref? a) (Deref? b))
-     (append
-      (list (Instr 'movq (list a (Reg 'rax))))
-      (list (Instr op (list (Reg 'rax) b)))
-      (patch-instrs-list more))]
-    [(list instr more ...)
-     (cons
-      instr
-      (patch-instrs-list more))]))
+; Vertices are stored in priority queue as (vertex, priority)
+(define (color-graph-<= v1 v2)
+  (>= (vector-ref v1 1) (vector-ref v2 1)))
 
-;; patch-instructions : psuedo-x86 -> x86
-(define (patch-instructions p)
-  (match p
-    [(X86Program info (list (cons 'start (Block blkinfo instrs))))
-     (let ([new-instrs (patch-instrs-list instrs)])
-       (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
+(define unassignable-register-mapping
+  (list (cons (Reg 'rax) -1)
+        (cons (Reg 'r11) -2)
+        (cons (Reg 'r15) -3)
+        (cons (Reg 'rbp) -4)
+        (cons (Reg 'rbx)  0)
+        (cons (Reg 'rcx)  1)
+        (cons (Reg 'rdx)  2)
+        (cons (Reg 'rsi)  3)
+        (cons (Reg 'rdi)  4)
+        (cons (Reg 'r8)   5)
+        (cons (Reg 'r9)   6)
+        (cons (Reg 'r10)  7)
+        (cons (Reg 'r12)  8)
+        (cons (Reg 'r13)  9)
+        (cons (Reg 'r14) 10)))
 
-; TODO: Fix stack frame size (Assumed to be 16?).
-(define (generate-prelude)
-  (list (cons 'main (Block '()
-                           (list (Instr 'pushq (list (Reg 'rbp)))
-                                 (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                                 (Instr 'subq (list (Imm 16000) (Reg 'rsp)))
-                                 (Jmp 'start))))))
+  (define (get-vertex-priority graph v)
+    (sequence-length (in-neighbors graph v)))
 
-; TODO: Fix stack frame size (Assumed to be 16?).
-(define (generate-conclusion)
-  (list (cons
-         'conclusion
-         (Block '()
-                (list (Instr 'addq (list (Imm 16000) (Reg 'rsp)))
-                      (Instr 'popq (list (Reg 'rbp)))
-                      (Retq))))))
+  (define (color-graph graph)
+    (let* ([queue (make-pqueue color-graph-<=)])
+      (for ([v (in-vertices graph)])
+        (match v
+          [(Reg _) void]
+          [_ (pqueue-push! queue (vector v (get-vertex-priority graph v)))]))
+      (color-graph-recurse graph queue unassignable-register-mapping)))
 
-;; prelude-and-conclusion : x86 -> x86
-(define (prelude-and-conclusion p)
-  (match p
-    [(X86Program info blocks)
-     (X86Program info (append (generate-prelude)
-                              blocks
-                              (generate-conclusion)))]))
+  (define (get-next-stack-loc env)
+    (* (- 8) (+ (length env) 1)))
 
-;; Define the compiler passes to be used by interp-tests and the grader
-;; Note that your compiler file (the file that defines the passes)
-;; must be named "compiler.rkt"
-(define compiler-passes
-  `(("uniquify" ,uniquify ,interp-Lvar)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
-    ("explicate control" ,explicate-control ,interp-Cvar)
-    ("instruction selection" ,select-instructions ,interp-x86-0)
-    ("uncover live" ,uncover-live ,interp-x86-0)
-    ("build interference graph" ,build-interference ,interp-x86-0)
-    ("assign homes" ,assign-homes ,interp-x86-0)
-    ("patch instructions" ,patch-instructions ,interp-x86-0)
-    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
-    ))
+  (define color-to-register-mapping
+    (list (cons  0  (Reg 'rbx))
+          (cons  1  (Reg 'rcx))
+          (cons  2  (Reg 'rdx))
+          (cons  3  (Reg 'rsi))
+          (cons  4  (Reg 'rdi))
+          (cons  5  (Reg 'r8))
+          (cons  6  (Reg 'r9))
+          (cons  7  (Reg 'r10))
+          (cons  8  (Reg 'r12))
+          (cons  9  (Reg 'r13))
+          (cons  10 (Reg 'r14))))
+
+  (define (get-stack-loc color)
+    (* -8 (+ (- color (length color-to-register-mapping)) 1)))
+
+  (define (get-mapping-from-color color)
+    (if (dict-has-key? color-to-register-mapping color)
+        (dict-ref color-to-register-mapping color)
+        (Deref 'rbp (get-stack-loc color))))
+
+  (define (allocate-registers-arg arg allocation)
+    (if (Var? arg)
+        (get-mapping-from-color (dict-ref allocation arg))
+        arg))
+
+  ; Assumes `Instrs` is the only instruction that can have arguements is `Instr`.
+  (define (allocate-registers-instrs instrs allocation)
+    (for/list ([instr instrs])
+      (match instr
+        [(Instr name args)
+         (Instr name (for/list ([arg args])
+                       (allocate-registers-arg arg allocation)))]
+        [_ instr])))
+
+  (define (allocate-registers-blocks blocks allocation)
+    (for/list ([block blocks])
+      (match block
+        [(cons label (Block blkinfo instrs))
+         (cons label (Block blkinfo (allocate-registers-instrs instrs allocation)))])))
+
+  ;; Allocate registers : Take out interference graph from info of program and do register allocation.
+  (define (allocate-registers p)
+    (match p
+      [(X86Program info blocks)
+       (let*
+           ([allocation (color-graph (dict-ref info 'conflicts))])
+         (X86Program info (allocate-registers-blocks blocks allocation)))]))
+
+  (define (patch-instrs-list instrs)
+    (match instrs
+      ['() '()]
+      [(list (Instr op (list a b)) more ...)
+       #:when (equal? a b)
+       (patch-instrs-list more)]
+      [(list (Instr op (list a b)) more ...)
+       #:when (and (Deref? a) (Deref? b))
+       (append
+        (list (Instr 'movq (list a (Reg 'rax))))
+        (list (Instr op (list (Reg 'rax) b)))
+        (patch-instrs-list more))]
+      [(list instr more ...)
+       (cons
+        instr
+        (patch-instrs-list more))]))
+
+  ;; patch-instructions : psuedo-x86 -> x86
+  (define (patch-instructions p)
+    (match p
+      [(X86Program info (list (cons 'start (Block blkinfo instrs))))
+       (let ([new-instrs (patch-instrs-list instrs)])
+         (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
+
+  ; TODO: Fix stack frame size (Assumed to be 16?).
+  (define (generate-prelude)
+    (list (cons 'main (Block '()
+                             (list (Instr 'pushq (list (Reg 'rbp)))
+                                   (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
+                                   (Instr 'subq (list (Imm 16000) (Reg 'rsp)))
+                                   (Jmp 'start))))))
+
+  ; TODO: Fix stack frame size (Assumed to be 16?).
+  (define (generate-conclusion)
+    (list (cons
+           'conclusion
+           (Block '()
+                  (list (Instr 'addq (list (Imm 16000) (Reg 'rsp)))
+                        (Instr 'popq (list (Reg 'rbp)))
+                        (Retq))))))
+
+  ;; prelude-and-conclusion : x86 -> x86
+  (define (prelude-and-conclusion p)
+    (match p
+      [(X86Program info blocks)
+       (X86Program info (append (generate-prelude)
+                                blocks
+                                (generate-conclusion)))]))
+
+  ;; Define the compiler passes to be used by interp-tests and the grader
+  ;; Note that your compiler file (the file that defines the passes)
+  ;; must be named "compiler.rkt"
+  (define compiler-passes
+    `(("uniquify" ,uniquify ,interp-Lvar)
+      ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
+      ("explicate control" ,explicate-control ,interp-Cvar)
+      ("instruction selection" ,select-instructions ,interp-x86-0)
+      ("uncover live" ,uncover-live ,interp-x86-0)
+      ("build interference graph" ,build-interference ,interp-x86-0)
+      ("allocate registers" ,allocate-registers ,interp-x86-0)
+      ("patch instructions" ,patch-instructions ,interp-x86-0)
+      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+      ))
