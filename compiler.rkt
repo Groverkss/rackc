@@ -55,11 +55,33 @@
 ;; HW1 Passes
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; shrink : R1 -> R1
+;; Remove `and` and `or` from the language.
+(define (shrink-expr exp)
+  (match exp
+    ; (and e1 e2) => (if e1 e2 #f)
+    [(Prim 'and (list arg1 arg2))
+     (If (shrink-expr arg1) (shrink-expr arg2) (Bool #f))]
+    ; (or e1 e2) => (if e1 #t e2)
+    [(Prim 'or (list arg1 arg2))
+     (If (shrink-expr arg1) (Bool #t)(shrink-expr arg2) )]
+    [(Prim op args)
+     (Prim op (for/list ([arg args]) (shrink-expr arg)))]
+    [(Let x e t)
+     (Let x (shrink-expr e) (shrink-expr t))]
+    [(If e1 e2 e3)
+     (If (shrink-expr e1) (shrink-expr e2) (shrink-expr e3))]
+    [_ exp]))
+
+(define (shrink p)
+  (match p
+    [(Program info e)
+     (Program info (shrink-expr e))]))
+
 (define (uniquify-exp env)
   (lambda (e)
     (match e
       [(Var x) (Var (dict-ref env x))]
-      [(Int n) (Int n)]
       [(Let x e body)
        (let ([new-env (dict-set env x (gensym x))])
          (Let
@@ -67,7 +89,10 @@
           ((uniquify-exp env) e)
           ((uniquify-exp new-env) body)))]
       [(Prim op es)
-       (Prim op (for/list ([e es]) ((uniquify-exp env) e)))])))
+       (Prim op (for/list ([e es]) ((uniquify-exp env) e)))]
+      [(If e1 e2 e3)
+       (If ((uniquify-exp env) e1) ((uniquify-exp env) e2) ((uniquify-exp env) e3))]
+      [_ e])))
 
 ;; uniquify : R1 -> R1
 (define (uniquify p)
@@ -104,18 +129,17 @@
      (match (rco-atm body)
        [(list atm env)
         (list atm (append (list (list x (rco-exp e))) env))])]
-    ; Convert each es to an atom and collect their environment into env
-    ; using collect-env. Now, create a new tmp variable, and assign it to
-    ; be result of Prim. tmp-var = (Prim op atm-list). The new Prim created
-    ; must come at end of environment to preserve order of execuation of
-    ; statements.
+    ; Assign this exp variable and return enviroment as that assignment.
     [(Prim op es)
-     (match (collect-env es)
-       [(list atm-list env)
-        (let ([tmp-var (create-tmp-var)])
-          (list
-           (Var tmp-var)
-           (append env (list (list tmp-var (Prim op atm-list))))))])]))
+      (let ([tmp-var (create-tmp-var)])
+        (list
+          (Var tmp-var)
+          (list (list tmp-var (rco-exp ast)))))]
+    [(If e1 e2 e3)
+      (let ([tmp-var (create-tmp-var)])
+        (list
+          (Var tmp-var)
+          (list (list tmp-var (rco-exp ast)))))]))
 
 (define (create-let-from-env env body)
   (match env
@@ -127,13 +151,13 @@
 ; Returns an AST
 (define (rco-exp ast)
   (match ast
-    [(Int n) (Int n)]
-    [(Var x) (Var x)]
     [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
     [(Prim op es)
      (match (collect-env es)
        [(list atm-list env)
-        (create-let-from-env env (Prim op atm-list))])]))
+        (create-let-from-env env (Prim op atm-list))])]
+    [(If e1 e2 e3) (If (rco-exp e1) (rco-exp e2) (rco-exp e3))]
+    [_ ast]))
 
 ; remove-complex-opera* : R1 -> R1
 (define (remove-complex-opera* p)
@@ -390,133 +414,134 @@
         (cons (Reg 'r13)  9)
         (cons (Reg 'r14) 10)))
 
-  (define (get-vertex-priority graph v)
-    (sequence-length (in-neighbors graph v)))
+(define (get-vertex-priority graph v)
+  (sequence-length (in-neighbors graph v)))
 
-  (define (color-graph graph)
-    (let* ([queue (make-pqueue color-graph-<=)])
-      (for ([v (in-vertices graph)])
-        (match v
-          [(Reg _) void]
-          [_ (pqueue-push! queue (vector v (get-vertex-priority graph v)))]))
-      (color-graph-recurse graph queue unassignable-register-mapping)))
+(define (color-graph graph)
+  (let* ([queue (make-pqueue color-graph-<=)])
+    (for ([v (in-vertices graph)])
+      (match v
+        [(Reg _) void]
+        [_ (pqueue-push! queue (vector v (get-vertex-priority graph v)))]))
+    (color-graph-recurse graph queue unassignable-register-mapping)))
 
-  (define (get-next-stack-loc env)
-    (* (- 8) (+ (length env) 1)))
+(define (get-next-stack-loc env)
+  (* (- 8) (+ (length env) 1)))
 
-  (define color-to-register-mapping
-    (list (cons  0  (Reg 'rbx))
-          (cons  1  (Reg 'rcx))
-          (cons  2  (Reg 'rdx))
-          (cons  3  (Reg 'rsi))
-          (cons  4  (Reg 'rdi))
-          (cons  5  (Reg 'r8))
-          (cons  6  (Reg 'r9))
-          (cons  7  (Reg 'r10))
-          (cons  8  (Reg 'r12))
-          (cons  9  (Reg 'r13))
-          (cons  10 (Reg 'r14))))
+(define color-to-register-mapping
+  (list (cons  0  (Reg 'rbx))
+        (cons  1  (Reg 'rcx))
+        (cons  2  (Reg 'rdx))
+        (cons  3  (Reg 'rsi))
+        (cons  4  (Reg 'rdi))
+        (cons  5  (Reg 'r8))
+        (cons  6  (Reg 'r9))
+        (cons  7  (Reg 'r10))
+        (cons  8  (Reg 'r12))
+        (cons  9  (Reg 'r13))
+        (cons  10 (Reg 'r14))))
 
-  (define (get-stack-loc color)
-    (* -8 (+ (- color (length color-to-register-mapping)) 1)))
+(define (get-stack-loc color)
+  (* -8 (+ (- color (length color-to-register-mapping)) 1)))
 
-  (define (get-mapping-from-color color)
-    (if (dict-has-key? color-to-register-mapping color)
-        (dict-ref color-to-register-mapping color)
-        (Deref 'rbp (get-stack-loc color))))
+(define (get-mapping-from-color color)
+  (if (dict-has-key? color-to-register-mapping color)
+      (dict-ref color-to-register-mapping color)
+      (Deref 'rbp (get-stack-loc color))))
 
-  (define (allocate-registers-arg arg allocation)
-    (if (Var? arg)
-        (get-mapping-from-color (dict-ref allocation arg))
-        arg))
+(define (allocate-registers-arg arg allocation)
+  (if (Var? arg)
+      (get-mapping-from-color (dict-ref allocation arg))
+      arg))
 
-  ; Assumes `Instrs` is the only instruction that can have arguements is `Instr`.
-  (define (allocate-registers-instrs instrs allocation)
-    (for/list ([instr instrs])
-      (match instr
-        [(Instr name args)
-         (Instr name (for/list ([arg args])
-                       (allocate-registers-arg arg allocation)))]
-        [_ instr])))
+; Assumes `Instrs` is the only instruction that can have arguements is `Instr`.
+(define (allocate-registers-instrs instrs allocation)
+  (for/list ([instr instrs])
+    (match instr
+      [(Instr name args)
+       (Instr name (for/list ([arg args])
+                     (allocate-registers-arg arg allocation)))]
+      [_ instr])))
 
-  (define (allocate-registers-blocks blocks allocation)
-    (for/list ([block blocks])
-      (match block
-        [(cons label (Block blkinfo instrs))
-         (cons label (Block blkinfo (allocate-registers-instrs instrs allocation)))])))
+(define (allocate-registers-blocks blocks allocation)
+  (for/list ([block blocks])
+    (match block
+      [(cons label (Block blkinfo instrs))
+       (cons label (Block blkinfo (allocate-registers-instrs instrs allocation)))])))
 
-  ;; Allocate registers : Take out interference graph from info of program and do register allocation.
-  (define (allocate-registers p)
-    (match p
-      [(X86Program info blocks)
-       (let*
-           ([allocation (color-graph (dict-ref info 'conflicts))])
-         (X86Program info (allocate-registers-blocks blocks allocation)))]))
+;; Allocate registers : Take out interference graph from info of program and do register allocation.
+(define (allocate-registers p)
+  (match p
+    [(X86Program info blocks)
+     (let*
+         ([allocation (color-graph (dict-ref info 'conflicts))])
+       (X86Program info (allocate-registers-blocks blocks allocation)))]))
 
-  (define (patch-instrs-list instrs)
-    (match instrs
-      ['() '()]
-      [(list (Instr op (list a b)) more ...)
-       #:when (equal? a b)
-       (patch-instrs-list more)]
-      [(list (Instr op (list a b)) more ...)
-       #:when (and (Deref? a) (Deref? b))
-       (append
-        (list (Instr 'movq (list a (Reg 'rax))))
-        (list (Instr op (list (Reg 'rax) b)))
-        (patch-instrs-list more))]
-      [(list instr more ...)
-       (cons
-        instr
-        (patch-instrs-list more))]))
+(define (patch-instrs-list instrs)
+  (match instrs
+    ['() '()]
+    [(list (Instr op (list a b)) more ...)
+     #:when (equal? a b)
+     (patch-instrs-list more)]
+    [(list (Instr op (list a b)) more ...)
+     #:when (and (Deref? a) (Deref? b))
+     (append
+      (list (Instr 'movq (list a (Reg 'rax))))
+      (list (Instr op (list (Reg 'rax) b)))
+      (patch-instrs-list more))]
+    [(list instr more ...)
+     (cons
+      instr
+      (patch-instrs-list more))]))
 
-  ;; patch-instructions : psuedo-x86 -> x86
-  (define (patch-instructions p)
-    (match p
-      [(X86Program info (list (cons 'start (Block blkinfo instrs))))
-       (let ([new-instrs (patch-instrs-list instrs)])
-         (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
+;; patch-instructions : psuedo-x86 -> x86
+(define (patch-instructions p)
+  (match p
+    [(X86Program info (list (cons 'start (Block blkinfo instrs))))
+     (let ([new-instrs (patch-instrs-list instrs)])
+       (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
 
-  ; TODO: Fix stack frame size (Assumed to be 16?).
-  ;       Also take care of callq instructions stack thingy mentioned
-  ;       in chapter 3 
-  (define (generate-prelude)
-    (list (cons 'main (Block '()
-                             (list (Instr 'pushq (list (Reg 'rbp)))
-                                   (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                                   (Instr 'subq (list (Imm 16000) (Reg 'rsp)))
-                                   (Jmp 'start))))))
+; TODO: Fix stack frame size (Assumed to be 16?).
+;       Also take care of callq instructions stack thingy mentioned
+;       in chapter 3
+(define (generate-prelude)
+  (list (cons 'main (Block '()
+                           (list (Instr 'pushq (list (Reg 'rbp)))
+                                 (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
+                                 (Instr 'subq (list (Imm 16000) (Reg 'rsp)))
+                                 (Jmp 'start))))))
 
-  ; TODO: Fix stack frame size (Assumed to be 16?).
-  ;       Also take care of callq instructions stack thingy mentioned
-  ;       in chapter 3 
-  (define (generate-conclusion)
-    (list (cons
-           'conclusion
-           (Block '()
-                  (list (Instr 'addq (list (Imm 16000) (Reg 'rsp)))
-                        (Instr 'popq (list (Reg 'rbp)))
-                        (Retq))))))
+; TODO: Fix stack frame size (Assumed to be 16?).
+;       Also take care of callq instructions stack thingy mentioned
+;       in chapter 3
+(define (generate-conclusion)
+  (list (cons
+         'conclusion
+         (Block '()
+                (list (Instr 'addq (list (Imm 16000) (Reg 'rsp)))
+                      (Instr 'popq (list (Reg 'rbp)))
+                      (Retq))))))
 
-  ;; prelude-and-conclusion : x86 -> x86
-  (define (prelude-and-conclusion p)
-    (match p
-      [(X86Program info blocks)
-       (X86Program info (append (generate-prelude)
-                                blocks
-                                (generate-conclusion)))]))
+;; prelude-and-conclusion : x86 -> x86
+(define (prelude-and-conclusion p)
+  (match p
+    [(X86Program info blocks)
+     (X86Program info (append (generate-prelude)
+                              blocks
+                              (generate-conclusion)))]))
 
-  ;; Define the compiler passes to be used by interp-tests and the grader
-  ;; Note that your compiler file (the file that defines the passes)
-  ;; must be named "compiler.rkt"
-  (define compiler-passes
-    `(("uniquify" ,uniquify ,interp-Lvar)
-      ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
-      ("explicate control" ,explicate-control ,interp-Cvar)
-      ("instruction selection" ,select-instructions ,interp-x86-0)
-      ("uncover live" ,uncover-live ,interp-x86-0)
-      ("build interference graph" ,build-interference ,interp-x86-0)
-      ("allocate registers" ,allocate-registers ,interp-x86-0)
-      ("patch instructions" ,patch-instructions ,interp-x86-0)
-      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
-      ))
+;; Define the compiler passes to be used by interp-tests and the grader
+;; Note that your compiler file (the file that defines the passes)
+;; must be named "compiler.rkt"
+(define compiler-passes
+  `(("shrink" ,shrink, interp-Lvar)
+    ("uniquify" ,uniquify ,interp-Lvar)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
+    ; ("explicate control" ,explicate-control ,interp-Cvar)
+    ; ("instruction selection" ,select-instructions ,interp-x86-0)
+    ; ("uncover live" ,uncover-live ,interp-x86-0)
+    ; ("build interference graph" ,build-interference ,interp-x86-0)
+    ; ("allocate registers" ,allocate-registers ,interp-x86-0)
+    ; ("patch instructions" ,patch-instructions ,interp-x86-0)
+    ; ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+    ))
