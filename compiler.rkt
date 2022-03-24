@@ -478,6 +478,8 @@
          (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
 
   ; TODO: Fix stack frame size (Assumed to be 16?).
+  ;       Also take care of callq instructions stack thingy mentioned
+  ;       in chapter 3 
   (define (generate-prelude)
     (list (cons 'main (Block '()
                              (list (Instr 'pushq (list (Reg 'rbp)))
@@ -486,6 +488,8 @@
                                    (Jmp 'start))))))
 
   ; TODO: Fix stack frame size (Assumed to be 16?).
+  ;       Also take care of callq instructions stack thingy mentioned
+  ;       in chapter 3 
   (define (generate-conclusion)
     (list (cons
            'conclusion
