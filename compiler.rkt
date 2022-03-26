@@ -164,34 +164,92 @@
   (match p
     [(Program info e) (Program info (rco-exp e))]))
 
+(define basic-blocks '())
+
+(define (create-block tail)
+  (match tail
+  [(Goto label) (Goto label)]
+  [_ (let ([label (gensym 'block)])
+    (set! basic-blocks (cons (cons label tail) basic-blocks))
+    (Goto label))]))
+
+; Check if a Prim op is a cmp.
+(define (is-prim-cmp op)
+  (or (equal? op 'eq?)
+      (equal? op '<)
+      (equal? op '<=)
+      (equal? op '>)
+      (equal? op '>=)))
+
+; `thn`, `els` are assumed to be tails i.e. they are
+; already passed through explicate-tail.
+(define (explicate-pred cnd thn els)
+  (match cnd
+    [(Var x)
+     (IfStmt cnd
+             (create-block thn)
+             (create-block els))]
+    [(Let x rhs body)
+     (explicate-assign rhs x (explicate-pred body thn els))]
+    [(Prim 'not (list e)) 
+      (IfStmt e
+            (create-block els)
+            (create-block thn))]
+    [(Prim op es) #:when (is-prim-cmp op)
+      (IfStmt (Prim op es)
+            (create-block thn)
+            (create-block els))]
+    [(Bool b) (if b thn els)]
+    ; Push cnd^ up and use thn^ and els^ as conditions for branches.
+    [(If cnd^ thn^ els^)
+     ; Create blocks for `thn` and `els` to prevent duplicates.
+     (let ([thn-goto (create-block thn)]
+           [els-goto (create-block els)])
+       (explicate-pred cnd^
+                       (explicate-pred thn^ thn-goto els-goto)
+                       (explicate-pred els^ thn-goto els-goto)))]
+    [else (error "explicate-pred unhandled case" cnd)]))
+
 (define (explicate-tail e)
   (match e
     [(Var x) (Return (Var x))]
     [(Int n) (Return (Int n))]
+    [(Bool n) (Return (Bool n))]
     [(Let x rhs body) (explicate-assign rhs x (explicate-tail body))]
     [(Prim op es) (Return (Prim op es))]
+    [(If cnd thn els)
+     (explicate-pred cnd (explicate-tail thn) (explicate-tail els))]
     [else (error "explicate-tail unhandled case" e)]))
 
 (define (explicate-assign e x cont)
   (match e
     [(Var y) (Seq (Assign (Var x) (Var y)) cont)]
     [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
+    [(Bool n) (Seq (Assign (Var x) (Bool n)) cont)]
     [(Let y rhs body)
      (explicate-assign rhs y (explicate-assign body x cont))]
     [(Prim op es) (Seq (Assign (Var x) (Prim op es)) cont)]
+    [(If cnd thn els)
+     (let ([cont-goto (create-block cont)])
+       (explicate-pred cnd
+                       (explicate-assign thn x cont-goto)
+                       (explicate-assign els x cont-goto)))]
     [else (error "explicate-assign unhandled case" e)]))
 
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
   (match p
     [(Program info body)
-     (CProgram info (list (cons 'start (explicate-tail body))))]))
+     (CProgram info (cons (cons 'start (explicate-tail body)) basic-blocks))]))
 
 (define (select-atm atm)
   (match atm
     [(Var x) (Var x)]
     [(Int n) (Imm n)]
-    [(Reg r) (Reg r)]))
+    [(Reg r) (Reg r)]
+    ; #t => 1
+    ; #f => 0
+    [(Bool b) (if b (Imm 1) (Imm 0))]))
 
 (define (get-op-name prim)
   (match prim
@@ -199,11 +257,41 @@
     [(Prim '- (list e1 e2)) 'subq]
     [(Prim '- (list e1)) 'negq]))
 
+(define (get-cmp-set-op op)
+  (match op
+    ['eq 'sete]
+    ['< 'setl]
+    ['<= 'setle]
+    ['> 'setg]
+    ['>= 'setge]))
+
 (define (select-assign x e)
   (match e
     ; movq e, x
     [atm #:when (atm? atm)
          (list (Instr 'movq (list (select-atm atm) x)))]
+
+    ; not x because e1 = x
+    [(Prim 'not (list e1)) #:when (equal? e1 x)
+                           (list (Instr 'xorq (list (Imm 1) (select-atm x))))]
+    ; movq e1, x ; not x
+    [(Prim 'not (list e1))
+     (list
+      (Instr 'movq (list (select-atm e1) x))
+      (Instr 'xorq (list (Imm 1) (select-atm x))))]
+
+    [(Prim 'read '())
+     (list
+      (Callq 'read_int 0)
+      (Instr 'movq (list (Reg 'rax) x)))]
+
+    ; (cmp e1 e2) => cmpq e2 e1, setcc %al, movzbq %al x
+    [(Prim op (list e1 e2)) #:when (is-prim-cmp op)
+                            (list
+                             (Instr 'cmpq (list (select-atm e2) (select-atm e1)))
+                             (Instr (get-cmp-set-op op) (list (ByteReg 'al)))
+                             (Instr 'movzbq (list (Reg 'al) (select-atm x))))]
+
     ; op x because e1 = x
     [(Prim op (list e1)) #:when (equal? e1 x)
                          (list (Instr (get-op-name e) (list (select-atm x))))]
@@ -212,7 +300,8 @@
      (list
       (Instr 'movq (list (select-atm e1) x))
       (Instr (get-op-name e) (list (select-atm x))))]
-    ; ; op e2 x because e1 = x
+
+    ; op e2 x because e1 = x
     [(Prim op (list e1 e2)) #:when (equal? e1 x)
                             (list (Instr
                                    (get-op-name e)
@@ -222,29 +311,53 @@
      (list
       (Instr 'movq (list (select-atm e1) x))
       (Instr (get-op-name e) (list (select-atm e2) x)))]
-    [(Prim 'read '())
-     (list
-      (Callq 'read_int 0)
-      (Instr 'movq (list (Reg 'rax) x)))]
-    [else (error "select-assign unhandled case")]))
+
+    [else (error "select-assign unhandled case" e)]))
 
 (define (select-stmt stmt)
   (match stmt
     [(Return e) (select-assign (Reg 'rax) e)]
     [(Assign x e) (select-assign x e)]
-    [else (error "select-stmt unhandled case")]))
+    [else (error "select-stmt unhandled case" stmt)]))
+
+(define (get-cmp-cnd op)
+  (match op
+    ['eq? 'e]
+    ['< 'l]
+    ['<= 'le]
+    ['> 'g]
+    ['>= 'ge]))
+
+; if (cmp e1 e2) thn els =>
+; cmpq e2 e1
+; je (label thn)
+; jmp (label els)
+(define (select-if cnd thn els)
+  (let ([label1 (match thn [(Goto label) label])]
+        [label2 (match els [(Goto label) label])])
+    (match cnd
+      [(Prim op (list e1 e2))
+       #:when (is-prim-cmp op)
+       (list (Instr 'cmpq (list (select-atm e2) (select-atm e1)))
+             (JmpIf (get-cmp-cnd op) label1)
+             (Jmp label2))])))
 
 (define (select-tail t)
   (match t
     [(Return x) (append (select-stmt t) (list (Jmp 'conclusion)))]
     [(Seq assign tail) (append (select-stmt assign) (select-tail tail))]
-    [else (error "select-tail unhandled case")]))
+    [(Goto label) (list (Jmp label))]
+    [(IfStmt cnd thn els) (select-if cnd thn els)]
+    [else (error "select-tail unhandled case" t)]))
 
 ;; select-instructions : C0 -> pseudo-x86
 (define (select-instructions p)
   (match p
-    [(CProgram info (list (cons 'start t)))
-     (X86Program info (list (cons 'start (Block '() (select-tail t)))))]))
+    [(CProgram info tails)
+     (X86Program info (for/list ([tail tails])
+                        (match tail
+                          [(cons label t)
+                           (cons label (Block '() (select-tail t)))])))]))
 
 (define (convert-to-regs names) (for/list ([reg names]) (Reg reg)))
 (define caller-saved-list (convert-to-regs (list 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)))
@@ -537,8 +650,8 @@
   `(("shrink" ,shrink, interp-Lvar)
     ("uniquify" ,uniquify ,interp-Lvar)
     ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
-    ; ("explicate control" ,explicate-control ,interp-Cvar)
-    ; ("instruction selection" ,select-instructions ,interp-x86-0)
+    ("explicate control" ,explicate-control ,interp-Cvar)
+    ("instruction selection" ,select-instructions ,interp-x86-0)
     ; ("uncover live" ,uncover-live ,interp-x86-0)
     ; ("build interference graph" ,build-interference ,interp-x86-0)
     ; ("allocate registers" ,allocate-registers ,interp-x86-0)
