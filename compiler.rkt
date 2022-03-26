@@ -121,6 +121,7 @@
 (define (rco-atm ast)
   (match ast
     [(Int n) (list (Int n) '())]
+    [(Bool n) (list (Bool n) '())]
     [(Var n) (list (Var n) '())]
     ; Convert body to an atom and return that. Push this Let into the
     ; environment. This Let must come before the inside environment to
@@ -186,7 +187,7 @@
 (define (explicate-pred cnd thn els)
   (match cnd
     [(Var x)
-     (IfStmt cnd
+     (IfStmt (Prim 'eq? (list cnd (Bool #t)))
              (create-block thn)
              (create-block els))]
     [(Let x rhs body)
@@ -247,6 +248,7 @@
     [(Var x) (Var x)]
     [(Int n) (Imm n)]
     [(Reg r) (Reg r)]
+    [(ByteReg r) (ByteReg r)]
     ; #t => 1
     ; #f => 0
     [(Bool b) (if b (Imm 1) (Imm 0))]))
@@ -259,7 +261,7 @@
 
 (define (get-cmp-set-op op)
   (match op
-    ['eq 'sete]
+    ['eq? 'sete]
     ['< 'setl]
     ['<= 'setle]
     ['> 'setg]
@@ -362,6 +364,7 @@
 (define (convert-to-regs names) (for/list ([reg names]) (Reg reg)))
 (define caller-saved-list (convert-to-regs (list 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)))
 (define callee-saved-list (convert-to-regs (list 'rsp 'rbp 'rbx 'r12 'r13 'r14 'r15)))
+(define labels->live (make-hash))
 
 ;; Get all write locations from an instruction.
 ;; TODO: Ask Bharat if all instructions do a write or is it only
@@ -372,7 +375,8 @@
     [(Instr _ `(,arg1)) (set arg1)]
     [(Callq _ _) (list->set caller-saved-list)]
     [(Jmp _) (set)]
-    [_ "Unimplemented instruction"]))
+    [(JmpIf _ _) (set)]
+    [_ (error "Unimplemented instruction" instr)]))
 
 ;; Get all read locations from an instruction.
 (define (get-read-locations instr)
@@ -381,37 +385,82 @@
      [(Instr _ (list args ...)) (list->set (filter (lambda (x) (not (Imm? x))) args))]
      [(Callq _ airty) (list->set (take callee-saved-list airty))]
      [(Jmp _) (set)]
-     [_ "Unimplemented instruction?"])
+     [(JmpIf _ _) (set)]
+     [_ (error "Unimplemented instruction?" instr)])
    (get-write-locations instr)))
+
+;; L_after(k) = (L_after(k + 1) - W(k + 1)) + R(k + 1)
+(define (compute-L_afterk L_afterk+1 instrk+1)
+  (set-union (set-subtract L_afterk+1
+                           (get-write-locations instrk+1))
+             (get-read-locations instrk+1)))
 
 (define (liveness-analysis-instrs instrs)
   (match instrs
-    ; L_after is empty for last instruction.
-    [(list instr) (list (set))]
-    ; L_after(k) = (L_after(k + 1) - W(k + 1)) + R(k + 1)
+    ; jmpcc, jmp -> use labels->live
+    [(list (JmpIf _ target1) (Jmp target2))
+     (let ([live-res (set-union
+                      (dict-ref labels->live target1)
+                      (dict-ref labels->live target2))])
+       (list live-res live-res))]
+    ; jmp -> use labels->live
+    [(list (Jmp target))
+     (list (dict-ref labels->live target))]
+    ; Base case.
     [(list _ instrk+1 _ ...)
      (let* ([anal (liveness-analysis-instrs (rest instrs))]
             [L_afterk+1 (car anal)])
-       (cons
-        (set-union (set-subtract
-                    L_afterk+1
-                    (get-write-locations instrk+1))
-                   (get-read-locations instrk+1))
-        anal))]))
+       (cons (compute-L_afterk L_afterk+1 instrk+1) anal))]))
 
 ;; Given a block, do a pass of backward dataflow analysis on it.
-(define (liveness-analysis block)
+(define (liveness-analysis-block block label)
   (match block
     [(Block blkinfo instrs)
-     (Block
-      (dict-set blkinfo 'liveness (liveness-analysis-instrs instrs))
-      instrs)]))
+     (let* ([liveness (liveness-analysis-instrs instrs)]
+            [label-liveness (compute-L_afterk
+                             (car liveness)
+                             (car instrs))])
+       ; Set liveness information for this label.
+       (dict-set! labels->live label label-liveness)
+       ; Attach livness to this block and return it.
+       (Block
+        (dict-set blkinfo 'liveness liveness)
+        instrs))]))
+
+;; Given a list of (cons label block), build a CFG.
+(define (build-liveness-cfg label-block-lst)
+  (let ([cfg (directed-graph '())])
+    ; Traverse through all blocks.
+    (for ([label-block label-block-lst])
+      (match label-block
+        [(cons label block)
+         (match block
+           [(Block blkinfo instrs)
+            ; Traverse through all instructions of a block.
+            (for ([instr instrs])
+              (match instr
+                ; For each instruction add edge in CFG for a jump.
+                [(JmpIf _ target) (add-directed-edge! cfg label target)]
+                [(Jmp target) (add-directed-edge! cfg label target)]
+                [_ null]))])]))
+    cfg))
+
+;; Given a list of (cons label block), do liveness analysis.
+(define (liveness-analysis-blocks label-block-lst)
+  (let* ([cfg (build-liveness-cfg label-block-lst)]
+         [label-order (tsort (transpose cfg))])
+    ; Set labels->live for conclusion.
+    (dict-set! labels->live 'conclusion (set (Reg 'rsp) (Reg 'rax)))
+    ; Evaluate all blocks. We run loop on (cdr label-rder)
+    ; to remove 'conclusion block, which will always be evaluated first.
+    (for/list ([label (cdr label-order)])
+      (cons label (liveness-analysis-block (dict-ref label-block-lst label) label)))))
 
 ;; Uncover live pass : Analysis to find live variables.
 (define (uncover-live p)
   (match p
-    [(X86Program info (list (cons 'start block)))
-     (X86Program info (list (cons 'start (liveness-analysis block))))]))
+    [(X86Program info label-block-lst)
+     (X86Program info (liveness-analysis-blocks label-block-lst))]))
 
 ; Add conflicts between set1 and set2
 (define (add-interference set1 set2 graph)
@@ -423,7 +472,8 @@
 (define (build-interference-instr L_afterk instr graph)
   (match instr
     ; Add edge between (d, v) \forall v \in L_after(k) | v != s or v != d
-    [(Instr 'movq (list s d))
+    [(Instr op (list s d))
+     #:when (or (eq? op 'movq) (eq? op 'movzbq))
      (add-vertex! graph d)
      ; Add vertex s and d, just in case no edge is added.
      (if (not (Imm? s))
@@ -511,7 +561,8 @@
   (>= (vector-ref v1 1) (vector-ref v2 1)))
 
 (define unassignable-register-mapping
-  (list (cons (Reg 'rax) -1)
+  (list (cons (ByteReg 'al) -10)
+        (cons (Reg 'rax) -1)
         (cons (Reg 'r11) -2)
         (cons (Reg 'r15) -3)
         (cons (Reg 'rbp) -4)
@@ -593,7 +644,7 @@
 (define (patch-instrs-list instrs)
   (match instrs
     ['() '()]
-    [(list (Instr op (list a b)) more ...)
+    [(list (Instr 'movq (list a b)) more ...)
      #:when (equal? a b)
      (patch-instrs-list more)]
     [(list (Instr op (list a b)) more ...)
@@ -602,17 +653,34 @@
       (list (Instr 'movq (list a (Reg 'rax))))
       (list (Instr op (list (Reg 'rax) b)))
       (patch-instrs-list more))]
+    [(list (Instr 'cmpq (list a (Imm b))) more ...)
+      (append
+        (list (Instr 'movq (list (Imm b) (Reg 'rax))))
+        (list (Instr 'cmpq (list a (Reg 'rax))))
+        (patch-instrs-list more))]
+    [(list (Instr 'movzbq (list a (Deref b num))) more ...)
+      (append
+        (list (Instr 'movzbq (list a (Reg 'rax))))
+        (list (Instr 'movq (list (Reg 'rax) (Deref b num))))
+        (patch-instrs-list more))]
     [(list instr more ...)
      (cons
       instr
       (patch-instrs-list more))]))
 
+(define (patch-instructions-blocks label-block-lst)
+  (for/list ([label-block label-block-lst])
+    (match label-block
+      [(cons label block)
+       (match block
+         [(Block blkinfo instrs)
+          (cons label (Block blkinfo (patch-instrs-list instrs)))])])))
+
 ;; patch-instructions : psuedo-x86 -> x86
 (define (patch-instructions p)
   (match p
-    [(X86Program info (list (cons 'start (Block blkinfo instrs))))
-     (let ([new-instrs (patch-instrs-list instrs)])
-       (X86Program info (list (cons 'start (Block blkinfo new-instrs)))))]))
+    [(X86Program info label-block-lst)
+     (X86Program info (patch-instructions-blocks label-block-lst))]))
 
 ; TODO: Fix stack frame size (Assumed to be 16?).
 ;       Also take care of callq instructions stack thingy mentioned
@@ -652,9 +720,9 @@
     ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar)
     ("explicate control" ,explicate-control ,interp-Cvar)
     ("instruction selection" ,select-instructions ,interp-x86-0)
-    ; ("uncover live" ,uncover-live ,interp-x86-0)
-    ; ("build interference graph" ,build-interference ,interp-x86-0)
-    ; ("allocate registers" ,allocate-registers ,interp-x86-0)
-    ; ("patch instructions" ,patch-instructions ,interp-x86-0)
-    ; ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+    ("uncover live" ,uncover-live ,interp-x86-0)
+    ("build interference graph" ,build-interference ,interp-x86-0)
+    ("allocate registers" ,allocate-registers ,interp-x86-0)
+    ("patch instructions" ,patch-instructions ,interp-x86-0)
+    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
     ))
