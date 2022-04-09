@@ -1,0 +1,1 @@
+(let ([x (if (> (read) 10) (read) 42)]) x)

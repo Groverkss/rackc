@@ -193,9 +193,7 @@
     [(Let x rhs body)
      (explicate-assign rhs x (explicate-pred body thn els))]
     [(Prim 'not (list e)) 
-      (IfStmt e
-            (create-block els)
-            (create-block thn))]
+      (explicate-pred e els thn)]
     [(Prim op es) #:when (is-prim-cmp op)
       (IfStmt (Prim op es)
             (create-block thn)
@@ -371,6 +369,8 @@
 ;;       movq.
 (define (get-write-locations instr)
   (match instr
+    ; `cmpq` instructions do not write.
+    [(Instr 'cmpq _) (set)]
     [(Instr _ `(,arg1 ,arg2)) (set arg2)]
     [(Instr _ `(,arg1)) (set arg1)]
     [(Callq _ _) (list->set caller-saved-list)]
@@ -469,19 +469,22 @@
     (add-edge! graph s1 s2))
   graph)
 
+(define (add-vertices-interference! instr graph)
+  (match instr
+    [(Instr op args)
+     (for ([arg args])
+       (if (not (Imm? arg))
+           (add-vertex! graph arg)
+           void))]
+    [_ void]))
+
 (define (build-interference-instr L_afterk instr graph)
+  (add-vertices-interference! instr graph)
   (match instr
     ; Add edge between (d, v) \forall v \in L_after(k) | v != s or v != d
     [(Instr op (list s d))
      #:when (or (eq? op 'movq) (eq? op 'movzbq))
      (add-vertex! graph d)
-     ; Add vertex s and d, just in case no edge is added.
-     (if (not (Imm? s))
-         (add-vertex! graph s)
-         void)
-     (if (not (Imm? d))
-         (add-vertex! graph d)
-         void)
      ; Add edges
      (let* ([filtered_L (set-subtract L_afterk (set s d))])
        (add-interference filtered_L (set d) graph))]
@@ -654,15 +657,15 @@
       (list (Instr op (list (Reg 'rax) b)))
       (patch-instrs-list more))]
     [(list (Instr 'cmpq (list a (Imm b))) more ...)
-      (append
-        (list (Instr 'movq (list (Imm b) (Reg 'rax))))
-        (list (Instr 'cmpq (list a (Reg 'rax))))
-        (patch-instrs-list more))]
+     (append
+      (list (Instr 'movq (list (Imm b) (Reg 'rax))))
+      (list (Instr 'cmpq (list a (Reg 'rax))))
+      (patch-instrs-list more))]
     [(list (Instr 'movzbq (list a (Deref b num))) more ...)
-      (append
-        (list (Instr 'movzbq (list a (Reg 'rax))))
-        (list (Instr 'movq (list (Reg 'rax) (Deref b num))))
-        (patch-instrs-list more))]
+     (append
+      (list (Instr 'movzbq (list a (Reg 'rax))))
+      (list (Instr 'movq (list (Reg 'rax) (Deref b num))))
+      (patch-instrs-list more))]
     [(list instr more ...)
      (cons
       instr
@@ -689,7 +692,7 @@
   (list (cons 'main (Block '()
                            (list (Instr 'pushq (list (Reg 'rbp)))
                                  (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                                 (Instr 'subq (list (Imm 16000) (Reg 'rsp)))
+                                 (Instr 'subq (list (Imm 64000) (Reg 'rsp)))
                                  (Jmp 'start))))))
 
 ; TODO: Fix stack frame size (Assumed to be 16?).
@@ -699,7 +702,7 @@
   (list (cons
          'conclusion
          (Block '()
-                (list (Instr 'addq (list (Imm 16000) (Reg 'rsp)))
+                (list (Instr 'addq (list (Imm 64000) (Reg 'rsp)))
                       (Instr 'popq (list (Reg 'rbp)))
                       (Retq))))))
 
