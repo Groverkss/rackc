@@ -4,6 +4,7 @@
 (require "interp-Cvar.rkt")
 (require "interp-Cif.rkt")
 (require "interp-Cvec.rkt")
+(require "interp-Cwhile.rkt")
 (require "interp-Cfun.rkt")
 (require "interp-Clambda.rkt")
 (require "interp-Cwhile.rkt")
@@ -24,14 +25,16 @@
     ))
 
 
-(define interp-Cvecof-class (interp-Cvecof-mixin
-                             (interp-Cwhile-mixin
-                              (interp-Clambda-mixin
-                               (interp-Cfun-mixin
-                                (interp-Cvec-mixin
-                                 (interp-Cif-mixin
-                                  (interp-Cvar-mixin
-                                   interp-Lvecof-proxy-closure-class))))))))
+(define interp-Cvecof-class
+  (interp-Cvecof-mixin
+   (interp-Cwhile-mixin
+    (interp-Clambda-mixin
+     (interp-Cfun-mixin
+      (interp-Cvec-mixin
+       (interp-Cwhile-mixin
+        (interp-Cif-mixin
+         (interp-Cvar-mixin
+          interp-Lvecof-proxy-closure-class)))))))))
 
 (define (interp-Cvecof p)
   (send (new interp-Cvecof-class) interp-program p))

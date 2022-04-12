@@ -32,6 +32,8 @@
                             (match v [(Tagged v^ tg) (vector-set! v^ i a)]))]
         ['any-vector-length (lambda (v)
                             (match v [(Tagged v^ tg) (vector-length v^)]))]
+        ['any-vectorof-length (lambda (v)
+                              (match v [(Tagged v^ tg) (vector-length v^)]))]
         [else (super interp-op op)]))
 
     (define/public (apply-inject v tg) (Tagged v tg))

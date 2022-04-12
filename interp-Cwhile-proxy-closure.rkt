@@ -3,6 +3,7 @@
 (require "interp-Lwhile-proxy-closure.rkt")
 (require "interp-Cvar.rkt")
 (require "interp-Cif.rkt")
+(require "interp-Cwhile.rkt")
 (require "interp-Cvec.rkt")
 (require "interp-Cfun.rkt")
 (require "interp-Clambda.rkt")
@@ -13,9 +14,10 @@
                   (interp-Clambda-mixin
                    (interp-Cfun-mixin
                     (interp-Cvec-mixin
-                     (interp-Cif-mixin
-                      (interp-Cvar-mixin
-                       interp-Lwhile-proxy-closure-class)))))))
+                     (interp-Cwhile-mixin
+                      (interp-Cif-mixin
+                       (interp-Cvar-mixin
+                        interp-Lwhile-proxy-closure-class))))))))
 
 (define (interp-Cwhile-proxy-closure p)
   (send (new Cwhile-class) interp-program p))

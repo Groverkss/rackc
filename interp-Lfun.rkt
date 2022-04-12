@@ -1,7 +1,7 @@
 #lang racket
 (require racket/fixnum)
 (require "utilities.rkt")
-(require "interp-Lvec.rkt")
+(require "interp-Lvecof.rkt")
 (provide interp-Lfun interp-Lfun-class)
 
 ;; Note to maintainers of this code:
@@ -9,7 +9,7 @@
 ;;   kept in sync with this code.
 
 (define interp-Lfun-class
-  (class interp-Lvec-class
+  (class interp-Lvecof-class
     (super-new)
 
     (define/public (apply-fun fun-val arg-vals e)
@@ -26,10 +26,6 @@
       (define recur (interp-exp env))
       (verbose "Lfun/interp-exp" e)
       (match e
-        [(Var x) (unbox (dict-ref env x))]
-        [(Let x e body)
-         (define new-env (dict-set env x (box (recur e))))
-         ((interp-exp new-env) body)]
         [(Apply fun args)
          (define fun-val (recur fun))
          (define arg-vals (for/list ([e args]) (recur e)))
