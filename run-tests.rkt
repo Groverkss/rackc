@@ -2,11 +2,11 @@
 #lang racket
 
 (require "utilities.rkt")
-(require "interp-Lif.rkt")
+(require "interp-Lwhile.rkt")
 (require "interp.rkt")
-(require "type-check-Lif.rkt")
+(require "type-check-Lwhile.rkt")
 (require "compiler.rkt")
-; (debug-level 2)
+;(debug-level 1)
 (AST-output-syntax 'concrete-syntax)
 
 ;; all the files in the tests/ directory with extension ".rkt".
@@ -24,8 +24,8 @@
           (string=? r (car (string-split p "_"))))
         all-tests)))
 
-(interp-tests "cond" type-check-Lif compiler-passes interp-Lif "cond_test" (tests-for "cond"))
+; (interp-tests "while" type-check-Lwhile compiler-passes interp-Lwhile "while_test" (tests-for "while"))
 
 ;; Uncomment the following when all the passes are complete to
 ;; test the final x86 code.
-(compiler-tests "cond" type-check-Lif compiler-passes "cond_test" (tests-for "cond"))
+(compiler-tests "while" type-check-Lwhile compiler-passes "while_test" (tests-for "while"))
