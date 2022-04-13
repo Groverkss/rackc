@@ -2,8 +2,8 @@
 (require racket/set racket/stream)
 (require racket/fixnum)
 (require graph)
-(require "interp-Lif.rkt")
-(require "interp-Cif.rkt")
+(require "interp-Lwhile.rkt")
+(require "interp-Cwhile.rkt")
 (require "interp.rkt")
 (require "priority_queue.rkt")
 (require "utilities.rkt")
@@ -70,6 +70,9 @@
      (Let x (shrink-expr e) (shrink-expr t))]
     [(If e1 e2 e3)
      (If (shrink-expr e1) (shrink-expr e2) (shrink-expr e3))]
+    [(SetBang x e) (SetBang x (shrink-expr e))]
+    [(Begin es e) (Begin (for/list ([esp es]) (shrink-expr esp)) (shrink-expr e))]
+    [(WhileLoop cnd e) (WhileLoop (shrink-expr cnd) (shrink-expr e))]
     [_ exp]))
 
 (define (shrink p)
@@ -91,12 +94,73 @@
        (Prim op (for/list ([e es]) ((uniquify-exp env) e)))]
       [(If e1 e2 e3)
        (If ((uniquify-exp env) e1) ((uniquify-exp env) e2) ((uniquify-exp env) e3))]
+      [(SetBang x e)
+       (SetBang (dict-ref env x) ((uniquify-exp env) e))]
+      [(Begin es e)
+       (Begin (for/list ([esp es]) ((uniquify-exp env) esp)) ((uniquify-exp env) e))]
+      [(WhileLoop cnd e)
+       (WhileLoop ((uniquify-exp env) cnd) ((uniquify-exp env) e))]
       [_ e])))
 
 ;; uniquify : R1 -> R1
 (define (uniquify p)
   (match p
     [(Program info e) (Program info ((uniquify-exp '()) e))]))
+
+(define (collect-set! e)
+  (match e
+    [(Var x) (set)]
+    [(Int x) (set)]
+    [(Bool x) (set)]
+    [(Void) (set)]
+    [(Prim op args) 
+      (foldr (lambda (x v) (set-union v (collect-set! x))) (set) args)]
+    [(Let x e t) (set-union (collect-set! e) (collect-set! t))]
+    [(If e1 e2 e3)
+     (set-union (collect-set! e1) (collect-set! e2) (collect-set! e3))]
+    [(SetBang x e) (set-union (set x) (collect-set! e))]
+    [(Begin es e) 
+      (foldr (lambda (x v) (set-union v (collect-set! x))) (collect-set! e) es)]
+    [(WhileLoop cnd e) (set-union (collect-set! cnd) (collect-set! e))]))
+
+(define (uncover-get!-exp set!-vars exp)
+  (match exp
+    [(Var x) 
+      (if (set-member? set!-vars x)
+          (GetBang x)
+          (Var x))]
+    [(Int x) exp]
+    [(Bool x) exp]
+    [(Void) exp]
+    [(Prim op args)
+     (Prim op
+           (for/list ([arg args])
+             (uncover-get!-exp set!-vars arg)))]
+    [(Let x e t)
+     (Let x
+          (uncover-get!-exp set!-vars e)
+          (uncover-get!-exp set!-vars t))]
+    [(If e1 e2 e3)
+     (If (uncover-get!-exp set!-vars e1)
+         (uncover-get!-exp set!-vars e2)
+         (uncover-get!-exp set!-vars e3))]
+    [(SetBang x e)
+     (SetBang x (uncover-get!-exp set!-vars e))]
+    [(Begin es e)
+     (Begin
+      (for/list ([esp es])
+        (uncover-get!-exp set!-vars esp))
+      (uncover-get!-exp set!-vars e))]
+    [(WhileLoop cnd e)
+     (WhileLoop
+      (uncover-get!-exp set!-vars cnd)
+      (uncover-get!-exp set!-vars e))]))
+
+;; uncover-get! : Replace uses of mutable variables with (get! var)
+(define (uncover-get! p)
+  (match p
+    [(Program info e)
+     (Program info  (uncover-get!-exp (collect-set! e) e))]))
 
 ; Given a list of expressions, build atoms from the and collect their
 ; environment. Returns (list (list atoms), environment).
@@ -115,6 +179,12 @@
 (define (create-tmp-var)
   (gensym "tmp"))
 
+(define (create-as-tmp-exp ast)
+  (let ([tmp-var (create-tmp-var)])
+    (list
+     (Var tmp-var)
+     (list (list tmp-var (rco-exp ast))))))
+
 ; Given a AST, convert it into an atom.
 ; Returns (list atom environment)
 (define (rco-atm ast)
@@ -130,16 +200,12 @@
        [(list atm env)
         (list atm (append (list (list x (rco-exp e))) env))])]
     ; Assign this exp variable and return enviroment as that assignment.
-    [(Prim op es)
-      (let ([tmp-var (create-tmp-var)])
-        (list
-          (Var tmp-var)
-          (list (list tmp-var (rco-exp ast)))))]
-    [(If e1 e2 e3)
-      (let ([tmp-var (create-tmp-var)])
-        (list
-          (Var tmp-var)
-          (list (list tmp-var (rco-exp ast)))))]))
+    [(Prim op es) (create-as-tmp-exp ast)]
+    [(If e1 e2 e3) (create-as-tmp-exp ast)]
+    [(GetBang x) (create-as-tmp-exp ast)]
+    [(SetBang var exp) (create-as-tmp-exp ast)]
+    [(Begin exp-lst exp) (create-as-tmp-exp ast)]
+    [(WhileLoop cnd exp) (create-as-tmp-exp ast)]))
 
 (define (create-let-from-env env body)
   (match env
@@ -151,13 +217,24 @@
 ; Returns an AST
 (define (rco-exp ast)
   (match ast
+    [(Var x) ast]
+    [(Int x) ast]
+    [(Bool x) ast]
+    [(Void) ast]
     [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
     [(Prim op es)
      (match (collect-env es)
        [(list atm-list env)
         (create-let-from-env env (Prim op atm-list))])]
     [(If e1 e2 e3) (If (rco-exp e1) (rco-exp e2) (rco-exp e3))]
-    [_ ast]))
+    [(GetBang var) (Var var)]
+    [(SetBang var exp) (SetBang var (rco-exp exp))]
+    [(Begin exp-lst exp)
+     (Begin
+      (for/list ([exp-atm exp-lst])
+        (rco-exp exp-atm))
+      (rco-exp exp))]
+    [(WhileLoop cnd exp) (WhileLoop (rco-exp cnd) (rco-exp exp))]))
 
 ; remove-complex-opera* : R1 -> R1
 (define (remove-complex-opera* p)
@@ -168,10 +245,10 @@
 
 (define (create-block tail)
   (match tail
-  [(Goto label) (Goto label)]
-  [_ (let ([label (gensym 'block)])
-    (set! basic-blocks (cons (cons label tail) basic-blocks))
-    (Goto label))]))
+    [(Goto label) (Goto label)]
+    [_ (let ([label (gensym 'block)])
+         (set! basic-blocks (cons (cons label tail) basic-blocks))
+         (Goto label))]))
 
 ; Check if a Prim op is a cmp.
 (define (is-prim-cmp op)
@@ -180,6 +257,33 @@
       (equal? op '<=)
       (equal? op '>)
       (equal? op '>=)))
+
+(define (explicate-effect e cont)
+  (match e
+    [(Let y rhs body)
+     (explicate-assign rhs y (explicate-effect body cont))]
+    [(Prim 'read es) (Seq e cont)]
+    [(Prim op es) cont]
+    [(If cnd thn els)
+     (let ([cont-goto (create-block cont)])
+       (explicate-pred cnd
+                       (explicate-effect thn cont-goto)
+                       (explicate-effect els cont-goto)))]
+    [(WhileLoop cnd body)
+     (let* ([loop-label (gensym 'loop)]
+            [cont-goto (create-block cont)]
+            [loop-block
+             (explicate-pred cnd
+                             (create-block (explicate-effect body (Goto loop-label)))
+                             (create-block cont-goto))])
+       (set! basic-blocks
+              (cons (cons loop-label loop-block) basic-blocks))
+       (Goto loop-label))]
+    [(Begin es body) 
+      (let ([cont-body (explicate-effect body cont)])
+        (foldr explicate-effect cont-body es))]
+    [(SetBang var rhs) (explicate-assign rhs var cont)]
+    [else (error "explicate-effect unhandled case" e)]))
 
 ; `thn`, `els` are assumed to be tails i.e. they are
 ; already passed through explicate-tail.
@@ -191,12 +295,12 @@
              (create-block els))]
     [(Let x rhs body)
      (explicate-assign rhs x (explicate-pred body thn els))]
-    [(Prim 'not (list e)) 
-      (explicate-pred e els thn)]
+    [(Prim 'not (list e))
+     (explicate-pred e els thn)]
     [(Prim op es) #:when (is-prim-cmp op)
-      (IfStmt (Prim op es)
-            (create-block thn)
-            (create-block els))]
+                  (IfStmt (Prim op es)
+                          (create-block thn)
+                          (create-block els))]
     [(Bool b) (if b thn els)]
     ; Push cnd^ up and use thn^ and els^ as conditions for branches.
     [(If cnd^ thn^ els^)
@@ -213,10 +317,24 @@
     [(Var x) (Return (Var x))]
     [(Int n) (Return (Int n))]
     [(Bool n) (Return (Bool n))]
+    [(Void) (Return (Void))]
     [(Let x rhs body) (explicate-assign rhs x (explicate-tail body))]
     [(Prim op es) (Return (Prim op es))]
     [(If cnd thn els)
      (explicate-pred cnd (explicate-tail thn) (explicate-tail els))]
+    [(WhileLoop cnd body)
+     (let* ([loop-label (gensym 'loop)]
+            [loop-block
+             (explicate-pred cnd
+                             (create-block (explicate-effect body (Goto loop-label)))
+                             (create-block (Return (Void))))])
+       (set! basic-blocks
+              (cons (cons loop-label loop-block) basic-blocks))
+       (Goto loop-label))]
+    [(Begin es body) 
+      (let ([tail-body (explicate-tail body)])
+        (foldr explicate-effect tail-body es))]
+    [(SetBang var rhs) (explicate-assign rhs var (Return (Void)))]
     [else (error "explicate-tail unhandled case" e)]))
 
 (define (explicate-assign e x cont)
@@ -224,6 +342,7 @@
     [(Var y) (Seq (Assign (Var x) (Var y)) cont)]
     [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
     [(Bool n) (Seq (Assign (Var x) (Bool n)) cont)]
+    [(Void) (Seq (Assign (Var x) (Void)) cont)]
     [(Let y rhs body)
      (explicate-assign rhs y (explicate-assign body x cont))]
     [(Prim op es) (Seq (Assign (Var x) (Prim op es)) cont)]
@@ -232,6 +351,20 @@
        (explicate-pred cnd
                        (explicate-assign thn x cont-goto)
                        (explicate-assign els x cont-goto)))]
+    [(WhileLoop cnd body)
+     (let* ([loop-label (gensym 'loop)]
+            [cont-goto (create-block cont)]
+            [loop-block
+             (explicate-pred cnd
+                             (create-block (explicate-effect body (Goto loop-label)))
+                             (create-block (explicate-assign (Void) x cont-goto)))])
+       (set! basic-blocks
+              (cons (cons loop-label loop-block) basic-blocks))
+       (Goto loop-label))]
+    [(Begin es body) 
+      (let ([cont-body (explicate-assign body x cont)])
+        (foldr explicate-effect cont-body es))]
+    [(SetBang var rhs) (explicate-assign rhs var (Seq (Assign (Var x) (Void)) cont))]
     [else (error "explicate-assign unhandled case" e)]))
 
 ;; explicate-control : R1 -> C0
@@ -245,6 +378,7 @@
     [(Var x) (Var x)]
     [(Int n) (Imm n)]
     [(Reg r) (Reg r)]
+    [(Void) (Imm 0)]
     [(ByteReg r) (ByteReg r)]
     ; #t => 1
     ; #f => 0
@@ -317,6 +451,8 @@
   (match stmt
     [(Return e) (select-assign (Reg 'rax) e)]
     [(Assign x e) (select-assign x e)]
+    [(Prim 'read '())
+     (list (Callq 'read_int 0))]
     [else (error "select-stmt unhandled case" stmt)]))
 
 (define (get-cmp-cnd op)
@@ -717,14 +853,15 @@
 ;; Note that your compiler file (the file that defines the passes)
 ;; must be named "compiler.rkt"
 (define compiler-passes
-  `(("shrink" ,shrink, interp-Lif)
-    ("uniquify" ,uniquify ,interp-Lif)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lif)
-    ("explicate control" ,explicate-control ,interp-Cif)
-    ("instruction selection" ,select-instructions ,interp-x86-0)
-    ("uncover live" ,uncover-live ,interp-x86-0)
-    ("build interference graph" ,build-interference ,interp-x86-0)
-    ("allocate registers" ,allocate-registers ,interp-x86-0)
-    ("patch instructions" ,patch-instructions ,interp-x86-0)
-    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+  `(("shrink" ,shrink, interp-Lwhile)
+    ("uniquify" ,uniquify ,interp-Lwhile)
+    ("uncover get!" ,uncover-get!, interp-Lwhile)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lwhile)
+    ("explicate control" ,explicate-control ,interp-Cwhile)
+    ("instruction selection" ,select-instructions ,#f)
+    ; ("uncover live" ,uncover-live ,#f)
+    ; ("build interference graph" ,build-interference ,#f)
+    ; ("allocate registers" ,allocate-registers ,#f)
+    ; ("patch instructions" ,patch-instructions ,#f)
+    ; ("prelude-and-conclusion" ,prelude-and-conclusion ,#f)
     ))
