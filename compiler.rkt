@@ -1,6 +1,7 @@
 #lang racket
 (require racket/set racket/stream)
 (require racket/fixnum)
+(require data/queue)
 (require graph)
 (require "interp-Lwhile.rkt")
 (require "interp-Cwhile.rkt")
@@ -260,6 +261,10 @@
 
 (define (explicate-effect e cont)
   (match e
+    [(Var x) cont]
+    [(Int n) cont]
+    [(Bool n) cont]
+    [(Void) cont]
     [(Let y rhs body)
      (explicate-assign rhs y (explicate-effect body cont))]
     [(Prim 'read es) (Seq e cont)]
@@ -498,6 +503,7 @@
 (define caller-saved-list (convert-to-regs (list 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)))
 (define callee-saved-list (convert-to-regs (list 'rsp 'rbp 'rbx 'r12 'r13 'r14 'r15)))
 (define labels->live (make-hash))
+(define labels->blocks (make-hash))
 
 ;; Get all write locations from an instruction.
 ;; TODO: Ask Bharat if all instructions do a write or is it only
@@ -530,28 +536,25 @@
                            (get-write-locations instrk+1))
              (get-read-locations instrk+1)))
 
-(define (liveness-analysis-instrs instrs)
+(define (liveness-analysis-instrs instrs live->after)
   (match instrs
     ; jmpcc, jmp -> use labels->live
     [(list (JmpIf _ target1) (Jmp target2))
-     (let ([live-res (set-union
-                      (dict-ref labels->live target1)
-                      (dict-ref labels->live target2))])
-       (list live-res live-res))]
+     (list live->after live->after)]
     ; jmp -> use labels->live
     [(list (Jmp target))
-     (list (dict-ref labels->live target))]
+     (list live->after)]
     ; Base case.
     [(list _ instrk+1 _ ...)
-     (let* ([anal (liveness-analysis-instrs (rest instrs))]
+     (let* ([anal (liveness-analysis-instrs (rest instrs) live->after)]
             [L_afterk+1 (car anal)])
        (cons (compute-L_afterk L_afterk+1 instrk+1) anal))]))
 
 ;; Given a block, do a pass of backward dataflow analysis on it.
-(define (liveness-analysis-block block label)
+(define (liveness-analysis-block block label live->after)
   (match block
     [(Block blkinfo instrs)
-     (let* ([liveness (liveness-analysis-instrs instrs)]
+     (let* ([liveness (liveness-analysis-instrs instrs live->after)]
             [label-liveness (compute-L_afterk
                              (car liveness)
                              (car instrs))])
@@ -580,16 +583,45 @@
                 [_ null]))])]))
     cfg))
 
+(define (analyze_dataflow G transfer bottom join)
+  (define mapping (make-hash))
+  (for ([v (in-vertices G)])
+    (dict-set! mapping v bottom))
+  (define worklist (make-queue))
+  (for ([v (in-vertices G)])
+    (enqueue! worklist v))
+  (define trans-G (transpose G))
+  (while (not (queue-empty? worklist))
+         (define node (dequeue! worklist))
+         (define input (for/fold ([state bottom])
+                                 ([pred (in-neighbors trans-G node)])
+                         (join state (dict-ref mapping pred))))
+         (define output (transfer node input))
+         (cond [(not (equal? output (dict-ref mapping node)))
+                (dict-set! mapping node output)
+                (for ([v (in-neighbors G node)])
+                  (enqueue! worklist v))]))
+  mapping)
+
+(define (liveness-transfer label live->after)
+  (if (eq? label 'conclusion)
+      (set)
+      (let* ([blk (dict-ref labels->blocks label)]
+             [update-blk (liveness-analysis-block blk label live->after)])
+        (dict-set! labels->blocks label update-blk)
+        (dict-ref labels->live label))))
+
 ;; Given a list of (cons label block), do liveness analysis.
 (define (liveness-analysis-blocks label-block-lst)
-  (let* ([cfg (build-liveness-cfg label-block-lst)]
-         [label-order (tsort (transpose cfg))])
-    ; Set labels->live for conclusion.
-    (dict-set! labels->live 'conclusion (set (Reg 'rsp) (Reg 'rax)))
-    ; Evaluate all blocks. We run loop on (cdr label-rder)
-    ; to remove 'conclusion block, which will always be evaluated first.
-    (for/list ([label (cdr label-order)])
-      (cons label (liveness-analysis-block (dict-ref label-block-lst label) label)))))
+  (let* ([cfg (transpose (build-liveness-cfg label-block-lst))])
+    ; Set label -> block mapping in labels->blocks
+    (for ([label-block label-block-lst])
+      (match label-block
+        [(cons label block) (dict-set! labels->blocks label block)]))
+    ; Run dataflow analysis
+    (analyze_dataflow cfg liveness-transfer (set) set-union)
+    ; Return blocks with liveness set
+    (hash->list labels->blocks)))
 
 ;; Uncover live pass : Analysis to find live variables.
 (define (uncover-live p)
@@ -859,9 +891,9 @@
     ("remove complex opera*" ,remove-complex-opera* ,interp-Lwhile)
     ("explicate control" ,explicate-control ,interp-Cwhile)
     ("instruction selection" ,select-instructions ,#f)
-    ; ("uncover live" ,uncover-live ,#f)
-    ; ("build interference graph" ,build-interference ,#f)
-    ; ("allocate registers" ,allocate-registers ,#f)
-    ; ("patch instructions" ,patch-instructions ,#f)
-    ; ("prelude-and-conclusion" ,prelude-and-conclusion ,#f)
+    ("uncover live" ,uncover-live ,#f)
+    ("build interference graph" ,build-interference ,#f)
+    ("allocate registers" ,allocate-registers ,#f)
+    ("patch instructions" ,patch-instructions ,#f)
+    ("prelude-and-conclusion" ,prelude-and-conclusion ,#f)
     ))
