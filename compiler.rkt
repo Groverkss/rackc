@@ -193,6 +193,7 @@
     [(Int n) (list (Int n) '())]
     [(Bool n) (list (Bool n) '())]
     [(Var n) (list (Var n) '())]
+    [(Void) (list (Void) '())]
     ; Convert body to an atom and return that. Push this Let into the
     ; environment. This Let must come before the inside environment to
     ; preserve order of executation of statements.
