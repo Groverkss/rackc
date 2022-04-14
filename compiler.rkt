@@ -8,6 +8,7 @@
 (require "interp-Cvec.rkt")
 (require "interp.rkt")
 (require "type-check-Cvec.rkt")
+(require "type-check-Lvec.rkt")
 (require "priority_queue.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
@@ -354,6 +355,7 @@
      (explicate-assign rhs y (explicate-effect body cont))]
     [(Prim 'read es) (Seq e cont)]
     [(Prim 'vector-set! es) (Seq e cont)]
+    [(Prim op es) cont]
     [(If cnd thn els)
      (let ([cont-goto (create-block cont)])
        (explicate-pred cnd
@@ -809,9 +811,10 @@
     [_ void]))
 
 (define (is-vector-type locals-type var)
-  (match (dict-ref locals-type var)
-    [(list 'Vector _ ...) #t]
-    [_ #f]))
+  (dict-has-key? locals-type var)
+      (match (dict-ref locals-type var)
+        [(list 'Vector _ ...) #t]
+        [_ #f]))
 
 (define (build-interference-instr L_afterk instr graph locals-type)
   (add-vertices-interference! instr graph)
@@ -1011,7 +1014,6 @@
     [(X86Program info blocks)
      (let*
          ([allocation (color-graph (dict-ref info 'conflicts))])
-        (println allocation)
        (X86Program info (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]))
 
 (define (patch-instrs-list instrs)
@@ -1096,13 +1098,13 @@
 ;; Note that your compiler file (the file that defines the passes)
 ;; must be named "compiler.rkt"
 (define compiler-passes
-  `(("shrink" ,shrink, interp-Lvec)
-    ("uniquify" ,uniquify ,interp-Lvec)
-    ("expose allocation" ,expose-allocation ,interp-Lvec-prime)
-    ("uncover get!" ,uncover-get!, interp-Lvec-prime)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvec-prime)
+  `(("shrink" ,shrink, interp-Lvec, type-check-Lvec)
+    ("uniquify" ,uniquify ,interp-Lvec, type-check-Lvec)
+    ("expose allocation" ,expose-allocation ,interp-Lvec-prime, type-check-Lvec)
+    ("uncover get!" ,uncover-get!, interp-Lvec-prime, type-check-Lvec)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvec-prime, type-check-Lvec)
     ("explicate control" ,explicate-control ,interp-Cvec, type-check-Cvec)
-    ("instruction selection" ,select-instructions ,#f)
+    ("instruction selection" ,select-instructions, #f)
     ("uncover live" ,uncover-live ,#f)
     ("build interference graph" ,build-interference ,#f)
     ("allocate registers" ,allocate-registers ,#f)
