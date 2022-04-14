@@ -3,9 +3,11 @@
 (require racket/fixnum)
 (require data/queue)
 (require graph)
-(require "interp-Lwhile.rkt")
-(require "interp-Cwhile.rkt")
+(require "interp-Lvec.rkt")
+(require "interp-Lvec-prime.rkt")
+(require "interp-Cvec.rkt")
 (require "interp.rkt")
+(require "type-check-Cvec.rkt")
 (require "priority_queue.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
@@ -74,6 +76,7 @@
     [(SetBang x e) (SetBang x (shrink-expr e))]
     [(Begin es e) (Begin (for/list ([esp es]) (shrink-expr esp)) (shrink-expr e))]
     [(WhileLoop cnd e) (WhileLoop (shrink-expr cnd) (shrink-expr e))]
+    [(HasType e type) (HasType (shrink-expr e) type)]
     [_ exp]))
 
 (define (shrink p)
@@ -101,6 +104,7 @@
        (Begin (for/list ([esp es]) ((uniquify-exp env) esp)) ((uniquify-exp env) e))]
       [(WhileLoop cnd e)
        (WhileLoop ((uniquify-exp env) cnd) ((uniquify-exp env) e))]
+      [(HasType expr type) (HasType ((uniquify-exp env) expr) type)]
       [_ e])))
 
 ;; uniquify : R1 -> R1
@@ -108,31 +112,101 @@
   (match p
     [(Program info e) (Program info ((uniquify-exp '()) e))]))
 
+(define (wrap-lets args arg-vars cont)
+  (match arg-vars
+    ['() cont]
+    [(list var more ...)
+    (Let var (car args)
+          (wrap-lets (cdr args) more cont))]))
+
+(define (make-prim op . exp*)
+  (Prim op exp*))
+
+(define (allocate-vector-space len)
+  (If (make-prim '<
+                 (make-prim '+ (GlobalValue 'free_ptr)
+                            (Int (+ 8 len)))
+                 (GlobalValue 'fromspace_end))
+      (Void)
+      (Collect (+ 8 len))))
+
+(define (set-allocation-vals vector-name vars idx)
+  (match vars
+    ['() '()]
+    [(list var more ...)
+     (cons
+      (make-prim 'vector-set! (Var vector-name) (Int idx) (Var var))
+      (set-allocation-vals vector-name more (+ idx 1)))]))
+
+(define (expose-allocation-exp exp)
+  (match exp
+    [(Prim op args)
+     (Prim op (for/list ([arg args]) (expose-allocation-exp arg)))]
+    [(Let x e t)
+     (Let x (expose-allocation-exp e) (expose-allocation-exp t))]
+    [(If e1 e2 e3)
+     (If (expose-allocation-exp e1) (expose-allocation-exp e2) (expose-allocation-exp e3))]
+    [(SetBang x e) (SetBang x (expose-allocation-exp e))]
+    [(Begin es e) (Begin (for/list ([esp es]) (expose-allocation-exp esp)) (expose-allocation-exp e))]
+    [(WhileLoop cnd e) (WhileLoop (expose-allocation-exp cnd) (expose-allocation-exp e))]
+
+    ; (has-type (vector e0 ... e_{n-1}) type)
+    [(HasType (Prim 'vector args) type)
+     (define new-args
+      (for/list ([arg args])
+        (expose-allocation-exp arg)))
+     (define arg-vars (for/list ([arg new-args]) (gensym 'vecarg)))
+     (define vector-name (gensym 'vector))
+     (define len (* 8 (length new-args)))
+     (define set-vec-vals (set-allocation-vals vector-name arg-vars 0))
+
+     (wrap-lets new-args arg-vars
+                (Begin
+                 (list (allocate-vector-space len))
+                 (Let vector-name (Allocate (length new-args) type)
+                      (Begin
+                       set-vec-vals
+                       (Var vector-name)))))]
+
+    [(HasType e type) (HasType (expose-allocation-exp e) type)]
+    [_ exp]))
+
+(define (expose-allocation p)
+  (match p
+    [(Program info e) (Program info (expose-allocation-exp e))]))
+
 (define (collect-set! e)
   (match e
     [(Var x) (set)]
     [(Int x) (set)]
     [(Bool x) (set)]
     [(Void) (set)]
-    [(Prim op args) 
-      (foldr (lambda (x v) (set-union v (collect-set! x))) (set) args)]
+    [(Allocate _ _) (set)]
+    [(GlobalValue _) (set)] 
+    [(Collect _) (set)] 
+    [(Prim op args)
+     (foldr (lambda (x v) (set-union v (collect-set! x))) (set) args)]
     [(Let x e t) (set-union (collect-set! e) (collect-set! t))]
     [(If e1 e2 e3)
      (set-union (collect-set! e1) (collect-set! e2) (collect-set! e3))]
     [(SetBang x e) (set-union (set x) (collect-set! e))]
-    [(Begin es e) 
-      (foldr (lambda (x v) (set-union v (collect-set! x))) (collect-set! e) es)]
-    [(WhileLoop cnd e) (set-union (collect-set! cnd) (collect-set! e))]))
+    [(Begin es e)
+     (foldr (lambda (x v) (set-union v (collect-set! x))) (collect-set! e) es)]
+    [(WhileLoop cnd e) (set-union (collect-set! cnd) (collect-set! e))]
+    [(HasType expr _) (collect-set! expr)]))
 
 (define (uncover-get!-exp set!-vars exp)
   (match exp
-    [(Var x) 
-      (if (set-member? set!-vars x)
-          (GetBang x)
-          (Var x))]
+    [(Var x)
+     (if (set-member? set!-vars x)
+         (GetBang x)
+         (Var x))]
     [(Int x) exp]
     [(Bool x) exp]
     [(Void) exp]
+    [(Allocate _ _) exp]
+    [(GlobalValue _) exp] 
+    [(Collect _) exp] 
     [(Prim op args)
      (Prim op
            (for/list ([arg args])
@@ -155,7 +229,8 @@
     [(WhileLoop cnd e)
      (WhileLoop
       (uncover-get!-exp set!-vars cnd)
-      (uncover-get!-exp set!-vars e))]))
+      (uncover-get!-exp set!-vars e))]
+    [(HasType expr type) (HasType (uncover-get!-exp set!-vars expr) type)]))
 
 ;; uncover-get! : Replace uses of mutable variables with (get! var)
 (define (uncover-get! p)
@@ -207,7 +282,10 @@
     [(GetBang x) (create-as-tmp-exp ast)]
     [(SetBang var exp) (create-as-tmp-exp ast)]
     [(Begin exp-lst exp) (create-as-tmp-exp ast)]
-    [(WhileLoop cnd exp) (create-as-tmp-exp ast)]))
+    [(WhileLoop cnd exp) (create-as-tmp-exp ast)]
+    [(Collect _) (create-as-tmp-exp ast)]
+    [(Allocate _ _) (create-as-tmp-exp ast)]
+    [(GlobalValue _) (create-as-tmp-exp ast)]))
 
 (define (create-let-from-env env body)
   (match env
@@ -223,6 +301,9 @@
     [(Int x) ast]
     [(Bool x) ast]
     [(Void) ast]
+    [(Collect _) ast]
+    [(Allocate _ _) ast]
+    [(GlobalValue _) ast]
     [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
     [(Prim op es)
      (match (collect-env es)
@@ -266,10 +347,13 @@
     [(Int n) cont]
     [(Bool n) cont]
     [(Void) cont]
+    [(Collect _) (Seq e cont)]
+    [(Allocate _ _) (Seq e cont)]
+    [(GlobalValue _) (Seq e cont)]
     [(Let y rhs body)
      (explicate-assign rhs y (explicate-effect body cont))]
     [(Prim 'read es) (Seq e cont)]
-    [(Prim op es) cont]
+    [(Prim 'vector-set! es) (Seq e cont)]
     [(If cnd thn els)
      (let ([cont-goto (create-block cont)])
        (explicate-pred cnd
@@ -283,11 +367,11 @@
                              (create-block (explicate-effect body (Goto loop-label)))
                              (create-block cont-goto))])
        (set! basic-blocks
-              (cons (cons loop-label loop-block) basic-blocks))
+             (cons (cons loop-label loop-block) basic-blocks))
        (Goto loop-label))]
-    [(Begin es body) 
-      (let ([cont-body (explicate-effect body cont)])
-        (foldr explicate-effect cont-body es))]
+    [(Begin es body)
+     (let ([cont-body (explicate-effect body cont)])
+       (foldr explicate-effect cont-body es))]
     [(SetBang var rhs) (explicate-assign rhs var cont)]
     [else (error "explicate-effect unhandled case" e)]))
 
@@ -324,6 +408,9 @@
     [(Int n) (Return (Int n))]
     [(Bool n) (Return (Bool n))]
     [(Void) (Return (Void))]
+    [(Collect _) (Seq e (Return (Void)))]
+    [(Allocate _ _) (Seq e (Return (Void)))]
+    [(GlobalValue _) (Seq e (Return (Void)))]
     [(Let x rhs body) (explicate-assign rhs x (explicate-tail body))]
     [(Prim op es) (Return (Prim op es))]
     [(If cnd thn els)
@@ -335,11 +422,11 @@
                              (create-block (explicate-effect body (Goto loop-label)))
                              (create-block (Return (Void))))])
        (set! basic-blocks
-              (cons (cons loop-label loop-block) basic-blocks))
+             (cons (cons loop-label loop-block) basic-blocks))
        (Goto loop-label))]
-    [(Begin es body) 
-      (let ([tail-body (explicate-tail body)])
-        (foldr explicate-effect tail-body es))]
+    [(Begin es body)
+     (let ([tail-body (explicate-tail body)])
+       (foldr explicate-effect tail-body es))]
     [(SetBang var rhs) (explicate-assign rhs var (Return (Void)))]
     [else (error "explicate-tail unhandled case" e)]))
 
@@ -349,6 +436,9 @@
     [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
     [(Bool n) (Seq (Assign (Var x) (Bool n)) cont)]
     [(Void) (Seq (Assign (Var x) (Void)) cont)]
+    [(Allocate _ _) (Seq (Assign (Var x) e) cont)]
+    [(GlobalValue _) (Seq (Assign (Var x) e) cont)]
+    [(Collect _) (Seq e (explicate-assign (Void) x cont))]
     [(Let y rhs body)
      (explicate-assign rhs y (explicate-assign body x cont))]
     [(Prim op es) (Seq (Assign (Var x) (Prim op es)) cont)]
@@ -365,11 +455,11 @@
                              (create-block (explicate-effect body (Goto loop-label)))
                              (create-block (explicate-assign (Void) x cont-goto)))])
        (set! basic-blocks
-              (cons (cons loop-label loop-block) basic-blocks))
+             (cons (cons loop-label loop-block) basic-blocks))
        (Goto loop-label))]
-    [(Begin es body) 
-      (let ([cont-body (explicate-assign body x cont)])
-        (foldr explicate-effect cont-body es))]
+    [(Begin es body)
+     (let ([cont-body (explicate-assign body x cont)])
+       (foldr explicate-effect cont-body es))]
     [(SetBang var rhs) (explicate-assign rhs var (Seq (Assign (Var x) (Void)) cont))]
     [else (error "explicate-assign unhandled case" e)]))
 
@@ -404,11 +494,32 @@
     ['> 'setg]
     ['>= 'setge]))
 
+(define (8n+1 n)
+  (* 8 (+ n 1)))
+
+(define (type-mask type [mask 0])
+  (match type
+    [(list 'Vector) mask]
+    [(list 'Vector (list 'Vector _ ...) more ...)
+     (type-mask (cons 'Vector more)
+                (bitwise-ior 1 (arithmetic-shift mask 1)))]
+    [(list 'Vector _ more ...)
+     (type-mask (cons 'Vector more) (arithmetic-shift mask 1))]))
+
+(define (calculate-tag len type)
+  (bitwise-ior 1
+               (arithmetic-shift len 1)
+               (arithmetic-shift (type-mask type) 7)))
+
 (define (select-assign x e)
   (match e
     ; movq e, x
     [atm #:when (atm? atm)
          (list (Instr 'movq (list (select-atm atm) x)))]
+
+    [(GlobalValue var)
+     (list
+      (Instr 'movq (list (Global var) x)))]
 
     ; not x because e1 = x
     [(Prim 'not (list e1)) #:when (equal? e1 x)
@@ -422,7 +533,26 @@
     [(Prim 'read '())
      (list
       (Callq 'read_int 0)
-      (Instr 'movq (list (Reg 'rax) x)))]
+      (Instr 'movq (list (Reg 'rax) (select-atm x))))]
+
+    [(Prim 'vector-ref (list name (Int idx)))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (Deref 'r11 (8n+1 idx)) (select-atm x))))]
+
+    [(Prim 'vector-set! (list name (Int idx) var))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (select-atm var) (Deref 'r11 (8n+1 idx))))
+      (Instr 'movq (list (Imm 0) (select-atm x))))]
+
+    [(Prim 'vector-length (list name))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (Reg 'rax) (Deref 'r11 0)))
+      (Instr 'sarq (list (Reg 'rax)))
+      (Instr 'andq (list (Imm 63) (Reg 'rax)))
+      (Instr 'movq (list (Reg 'rax) (select-atm x))))]
 
     ; (cmp e1 e2) => cmpq e2 e1, setcc %al, movzbq %al x
     [(Prim op (list e1 e2)) #:when (is-prim-cmp op)
@@ -437,7 +567,7 @@
     ; movq e1, x ; op x
     [(Prim op (list e1))
      (list
-      (Instr 'movq (list (select-atm e1) x))
+      (Instr 'movq (list (select-atm e1) (select-atm x)))
       (Instr (get-op-name e) (list (select-atm x))))]
 
     ; op e2 x because e1 = x
@@ -448,8 +578,15 @@
     ; movq e1, x ; op e2, x
     [(Prim op (list e1 e2))
      (list
-      (Instr 'movq (list (select-atm e1) x))
-      (Instr (get-op-name e) (list (select-atm e2) x)))]
+      (Instr 'movq (list (select-atm e1) (select-atm x)))
+      (Instr (get-op-name e) (list (select-atm e2) (select-atm x))))]
+
+    [(Allocate len type)
+     (list
+      (Instr 'movq (list (Global 'free_ptr) (Reg 'r11)))
+      (Instr 'addq (list (Imm (8n+1 len)) (Global 'free_ptr)))
+      (Instr 'movq (list (Imm (calculate-tag len type)) (Deref 'r11 0)))
+      (Instr 'movq (list (Reg 'r11) (select-atm x))))]
 
     [else (error "select-assign unhandled case" e)]))
 
@@ -459,6 +596,15 @@
     [(Assign x e) (select-assign x e)]
     [(Prim 'read '())
      (list (Callq 'read_int 0))]
+    [(Prim 'vector-set! (list name (Int idx) x))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (select-atm x) (Deref 'r11 (8n+1 idx)))))]
+    [(Collect size)
+     (list
+      (Instr 'movq (list (Reg 'r15) (Reg 'rdi)))
+      (Instr 'movq (list (Imm size) (Reg 'rsi)))
+      (Callq 'collect 2))]
     [else (error "select-stmt unhandled case" stmt)]))
 
 (define (get-cmp-cnd op)
@@ -503,18 +649,30 @@
 (define (convert-to-regs names) (for/list ([reg names]) (Reg reg)))
 (define caller-saved-list (convert-to-regs (list 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)))
 (define callee-saved-list (convert-to-regs (list 'rsp 'rbp 'rbx 'r12 'r13 'r14 'r15)))
+(define function-call-list (convert-to-regs (list 'rdi 'rsi 'rdx 'rcx 'r8 'r9)))
 (define labels->live (make-hash))
 (define labels->blocks (make-hash))
 
+; Assumes that the registers used for Deref are either %rax or %r11.
+(define (sanitize-locations->set . atm*)
+  (list->set 
+    (filter
+      (lambda (x)
+        (match x
+          [(Var _) #t]
+          [(Reg _) #t]
+          [(Imm _) #f]
+          [(Deref _ _) #f]
+          [(Global _) #f]))
+        atm*)))
+  
 ;; Get all write locations from an instruction.
-;; TODO: Ask Bharat if all instructions do a write or is it only
-;;       movq.
 (define (get-write-locations instr)
   (match instr
     ; `cmpq` instructions do not write.
     [(Instr 'cmpq _) (set)]
-    [(Instr _ `(,arg1 ,arg2)) (set arg2)]
-    [(Instr _ `(,arg1)) (set arg1)]
+    [(Instr _ `(,arg1 ,arg2)) (sanitize-locations->set arg2)]
+    [(Instr _ `(,arg1)) (sanitize-locations->set arg1)]
     [(Callq _ _) (list->set caller-saved-list)]
     [(Jmp _) (set)]
     [(JmpIf _ _) (set)]
@@ -524,8 +682,12 @@
 (define (get-read-locations instr)
   (set-subtract
    (match instr
-     [(Instr _ (list args ...)) (list->set (filter (lambda (x) (not (Imm? x))) args))]
-     [(Callq _ airty) (list->set (take callee-saved-list airty))]
+     [(Instr 'movq (list arg1 arg2)) (sanitize-locations->set arg1)]
+     [(Instr 'movzbq (list arg1 arg2)) (sanitize-locations->set arg1)]
+     [(Instr 'leaq (list arg1 arg2)) (sanitize-locations->set arg1)]
+     [(Instr _ (list arg1 arg2)) (sanitize-locations->set arg1 arg2)]
+     [(Instr _ (list arg1)) (sanitize-locations->set arg1)]
+     [(Callq _ airty) (list->set (take function-call-list airty))]
      [(Jmp _) (set)]
      [(JmpIf _ _) (set)]
      [_ (error "Unimplemented instruction?" instr)])
@@ -646,39 +808,61 @@
            void))]
     [_ void]))
 
-(define (build-interference-instr L_afterk instr graph)
+(define (is-vector-type locals-type var)
+  (match (dict-ref locals-type var)
+    [(list 'Vector _ ...) #t]
+    [_ #f]))
+
+(define (build-interference-instr L_afterk instr graph locals-type)
   (add-vertices-interference! instr graph)
   (match instr
     ; Add edge between (d, v) \forall v \in L_after(k) | v != s or v != d
     [(Instr op (list s d))
      #:when (or (eq? op 'movq) (eq? op 'movzbq))
+     (add-vertex! graph s)
      (add-vertex! graph d)
      ; Add edges
      (let* ([filtered_L (set-subtract L_afterk (set s d))])
        (add-interference filtered_L (set d) graph))]
+    ; For callq collect, add edges between callee-saved registers registers and live vector types.
+    [(Callq 'collect 2)
+     (let* ([write-locs (get-write-locations instr)]
+            [filtered_L (set-subtract L_afterk write-locs)])
+       (add-interference filtered_L write-locs graph))
+     (define (get-label var)
+       (match var [(Var x) x] [_ null]))
+     (add-interference
+      (for/set ([var (set->list L_afterk)]
+                #:when (and (not (null? (get-label var)))
+                            (is-vector-type locals-type (get-label var))))
+        var)
+      callee-saved-list
+      graph)
+     ]
     ; For any other instruction, (d, v) \forall d \in write(instr) v \in L_afterk | v != d
     [_
      (let* ([write-locs (get-write-locations instr)]
             [filtered_L (set-subtract L_afterk write-locs)])
        (add-interference filtered_L write-locs graph))]))
 
-(define (build-interference-instrs liveness instrs graph)
+(define (build-interference-instrs liveness instrs graph locals-type)
   (match instrs
     ['() graph]
     [(list instr rest-instrs ...)
      (build-interference-instrs
       (cdr liveness)
       rest-instrs
-      (build-interference-instr (car liveness) instr graph))]))
+      (build-interference-instr (car liveness) instr graph locals-type) locals-type)]))
 
-(define (build-interference-blocks blocks graph)
+(define (build-interference-blocks blocks graph locals-type)
   (match blocks
     ['() graph]
     [(list (cons _ (Block blkinfo instrs)) rest-blocks ...)
      (build-interference-blocks
       rest-blocks
       (build-interference-instrs
-       (dict-ref blkinfo 'liveness) instrs graph))]))
+       (dict-ref blkinfo 'liveness) instrs graph locals-type)
+      locals-type)]))
 
 ;; Build Interference Graph : Analysis to find register conflicts.
 (define (build-interference p)
@@ -688,7 +872,10 @@
       (dict-set
        info
        'conflicts
-       (build-interference-blocks blocks (undirected-graph '())))
+       (build-interference-blocks
+        blocks
+        (undirected-graph '())
+        (dict-ref info 'locals-types)))
       blocks)]))
 
 ; TODO: Update priority of graph neighbours.
@@ -760,8 +947,10 @@
         [_ (pqueue-push! queue (vector v (get-vertex-priority graph v)))]))
     (color-graph-recurse graph queue unassignable-register-mapping)))
 
-(define (get-next-stack-loc env)
-  (* (- 8) (+ (length env) 1)))
+(define root-spill-stack-env (make-hash))
+
+(define (get-next-stack-loc-root)
+  (* 8 (+ (hash-count root-spill-stack-env) 1)))
 
 (define color-to-register-mapping
   (list (cons  0  (Reg 'rbx))
@@ -784,25 +973,37 @@
       (dict-ref color-to-register-mapping color)
       (Deref 'rbp (get-stack-loc color))))
 
-(define (allocate-registers-arg arg allocation)
-  (if (Var? arg)
-      (get-mapping-from-color (dict-ref allocation arg))
-      arg))
+(define (get-mapping-from-color-root color)
+  (if (dict-has-key? color-to-register-mapping color)
+      (dict-ref color-to-register-mapping color)
+      (if (not (dict-has-key? root-spill-stack-env color))
+          (let ([_ (dict-set! root-spill-stack-env color (get-next-stack-loc-root))])
+            (Deref 'r15 (dict-ref root-spill-stack-env color)))
+          (Deref 'r15 (dict-ref root-spill-stack-env color)))))
+
+(define (allocate-registers-arg arg allocation locals-type)
+  (match arg
+    ; Spilling should be done on root stack.
+    [(Var x) #:when (is-vector-type locals-type x)
+             (get-mapping-from-color-root (dict-ref allocation arg))]
+    ; Spilling should be done on stack.
+    [(Var x) (get-mapping-from-color (dict-ref allocation arg))]
+    [_ arg]))
 
 ; Assumes `Instrs` is the only instruction that can have arguements is `Instr`.
-(define (allocate-registers-instrs instrs allocation)
+(define (allocate-registers-instrs instrs allocation locals-type)
   (for/list ([instr instrs])
     (match instr
       [(Instr name args)
        (Instr name (for/list ([arg args])
-                     (allocate-registers-arg arg allocation)))]
+                     (allocate-registers-arg arg allocation locals-type)))]
       [_ instr])))
 
-(define (allocate-registers-blocks blocks allocation)
+(define (allocate-registers-blocks blocks allocation locals-type)
   (for/list ([block blocks])
     (match block
       [(cons label (Block blkinfo instrs))
-       (cons label (Block blkinfo (allocate-registers-instrs instrs allocation)))])))
+       (cons label (Block blkinfo (allocate-registers-instrs instrs allocation locals-type)))])))
 
 ;; Allocate registers : Take out interference graph from info of program and do register allocation.
 (define (allocate-registers p)
@@ -810,7 +1011,8 @@
     [(X86Program info blocks)
      (let*
          ([allocation (color-graph (dict-ref info 'conflicts))])
-       (X86Program info (allocate-registers-blocks blocks allocation)))]))
+        (println allocation)
+       (X86Program info (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]))
 
 (define (patch-instrs-list instrs)
   (match instrs
@@ -861,6 +1063,13 @@
                            (list (Instr 'pushq (list (Reg 'rbp)))
                                  (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
                                  (Instr 'subq (list (Imm 64000) (Reg 'rsp)))
+                                 (Instr 'movq (list (Imm 16384) (Reg 'rdi)))
+                                 (Instr 'movq (list (Imm 16384) (Reg 'rsi)))
+                                 (Callq 'initialize 2)
+                                 (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15)))
+                                 (Instr 'movq (list (Imm 0) (Deref 'r15 0)))
+                                 ; TODO: Change root  stack frame size here later.
+                                 (Instr 'addq (list (Imm 64000) (Reg 'r15)))
                                  (Jmp 'start))))))
 
 ; TODO: Fix stack frame size (Assumed to be 16?).
@@ -871,6 +1080,7 @@
          'conclusion
          (Block '()
                 (list (Instr 'addq (list (Imm 64000) (Reg 'rsp)))
+                      (Instr 'subq (list (Imm 64000) (Reg 'r15)))
                       (Instr 'popq (list (Reg 'rbp)))
                       (Retq))))))
 
@@ -886,11 +1096,12 @@
 ;; Note that your compiler file (the file that defines the passes)
 ;; must be named "compiler.rkt"
 (define compiler-passes
-  `(("shrink" ,shrink, interp-Lwhile)
-    ("uniquify" ,uniquify ,interp-Lwhile)
-    ("uncover get!" ,uncover-get!, interp-Lwhile)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lwhile)
-    ("explicate control" ,explicate-control ,interp-Cwhile)
+  `(("shrink" ,shrink, interp-Lvec)
+    ("uniquify" ,uniquify ,interp-Lvec)
+    ("expose allocation" ,expose-allocation ,interp-Lvec-prime)
+    ("uncover get!" ,uncover-get!, interp-Lvec-prime)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvec-prime)
+    ("explicate control" ,explicate-control ,interp-Cvec, type-check-Cvec)
     ("instruction selection" ,select-instructions ,#f)
     ("uncover live" ,uncover-live ,#f)
     ("build interference graph" ,build-interference ,#f)
