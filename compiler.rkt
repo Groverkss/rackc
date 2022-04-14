@@ -58,6 +58,13 @@
 ;; HW1 Passes
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(define (reset-global p)
+  (set! basic-blocks '())
+  (set! labels->live (make-hash))
+  (set! labels->blocks (make-hash))
+  (set! root-spill-stack-env (make-hash))
+  p)
+
 ;; shrink : R1 -> R1
 ;; Remove `and` and `or` from the language.
 (define (shrink-expr exp)
@@ -551,7 +558,7 @@
     [(Prim 'vector-length (list name))
      (list
       (Instr 'movq (list (select-atm name) (Reg 'r11)))
-      (Instr 'movq (list (Reg 'rax) (Deref 'r11 0)))
+      (Instr 'movq (list (Deref 'r11 0) (Reg 'rax)))
       (Instr 'sarq (list (Reg 'rax)))
       (Instr 'andq (list (Imm 63) (Reg 'rax)))
       (Instr 'movq (list (Reg 'rax) (select-atm x))))]
@@ -953,7 +960,7 @@
 (define root-spill-stack-env (make-hash))
 
 (define (get-next-stack-loc-root)
-  (* 8 (+ (hash-count root-spill-stack-env) 1)))
+  (* -8 (+ (hash-count root-spill-stack-env) 1)))
 
 (define color-to-register-mapping
   (list (cons  0  (Reg 'rbx))
@@ -1064,14 +1071,14 @@
   (list (cons 'main (Block '()
                            (list (Instr 'pushq (list (Reg 'rbp)))
                                  (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                                 (Instr 'subq (list (Imm 64000) (Reg 'rsp)))
+                                 (Instr 'subq (list (Imm 32768) (Reg 'rsp)))
                                  (Instr 'movq (list (Imm 16384) (Reg 'rdi)))
                                  (Instr 'movq (list (Imm 16384) (Reg 'rsi)))
                                  (Callq 'initialize 2)
                                  (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15)))
                                  (Instr 'movq (list (Imm 0) (Deref 'r15 0)))
                                  ; TODO: Change root  stack frame size here later.
-                                 (Instr 'addq (list (Imm 64000) (Reg 'r15)))
+                                 (Instr 'addq (list (Imm (* 8 (hash-count root-spill-stack-env))) (Reg 'r15)))
                                  (Jmp 'start))))))
 
 ; TODO: Fix stack frame size (Assumed to be 16?).
@@ -1081,8 +1088,8 @@
   (list (cons
          'conclusion
          (Block '()
-                (list (Instr 'addq (list (Imm 64000) (Reg 'rsp)))
-                      (Instr 'subq (list (Imm 64000) (Reg 'r15)))
+                (list (Instr 'addq (list (Imm 32768) (Reg 'rsp)))
+                      (Instr 'subq (list (Imm (* 8 (hash-count root-spill-stack-env))) (Reg 'r15)))
                       (Instr 'popq (list (Reg 'rbp)))
                       (Retq))))))
 
@@ -1098,16 +1105,17 @@
 ;; Note that your compiler file (the file that defines the passes)
 ;; must be named "compiler.rkt"
 (define compiler-passes
-  `(("shrink" ,shrink, interp-Lvec, type-check-Lvec)
-    ("uniquify" ,uniquify ,interp-Lvec, type-check-Lvec)
-    ("expose allocation" ,expose-allocation ,interp-Lvec-prime, type-check-Lvec)
-    ("uncover get!" ,uncover-get!, interp-Lvec-prime, type-check-Lvec)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvec-prime, type-check-Lvec)
-    ("explicate control" ,explicate-control ,interp-Cvec, type-check-Cvec)
-    ("instruction selection" ,select-instructions, #f)
-    ("uncover live" ,uncover-live ,#f)
-    ("build interference graph" ,build-interference ,#f)
-    ("allocate registers" ,allocate-registers ,#f)
-    ("patch instructions" ,patch-instructions ,#f)
-    ("prelude-and-conclusion" ,prelude-and-conclusion ,#f)
+  `(("reset global" ,reset-global, interp-Lvec ,type-check-Lvec)
+    ("shrink" ,shrink, interp-Lvec ,type-check-Lvec)
+    ("uniquify" ,uniquify ,interp-Lvec ,type-check-Lvec)
+    ("expose allocation" ,expose-allocation ,interp-Lvec-prime ,type-check-Lvec)
+    ("uncover get!" ,uncover-get!, interp-Lvec-prime ,type-check-Lvec)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvec-prime ,type-check-Lvec)
+    ("explicate control" ,explicate-control ,interp-Cvec ,type-check-Cvec)
+    ("instruction selection" ,select-instructions #f)
+    ("uncover live" ,uncover-live #f)
+    ("build interference graph" ,build-interference #f)
+    ("allocate registers" ,allocate-registers #f)
+    ("patch instructions" ,patch-instructions #f)
+    ("prelude-and-conclusion" ,prelude-and-conclusion #f)
     ))
