@@ -670,6 +670,7 @@
         (match x
           [(Var _) #t]
           [(Reg _) #t]
+          [(ByteReg _) #t]
           [(Imm _) #f]
           [(Deref _ _) #f]
           [(Global _) #f]))
