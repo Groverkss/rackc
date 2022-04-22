@@ -901,21 +901,38 @@
      t))
   (get-mex-color-start s 0))
 
+; Given a set of colors, find the MEX starting from 0, but for numbers greater
+; than 10, start from -6 and keep going down.
+(define (get-mex-heap-color s)
+  (define (get-mex-heap-color-start s t)
+    (if (set-member? s t)
+        (get-mex-heap-color-start
+         s
+         (cond
+           [(eq? t 10) -6]
+           [(<= t -6) (- t 1)]
+           [else (+ t 1)]))
+        t))
+  (get-mex-heap-color-start s 0))
+
 ; Returns -1 for unassigned neighbors. This doesn't affect
-; algorithm since we take MEX from 0.
+; algorithm since we cannot assign -1 anyway.
 (define (get-neighbor-colors graph current-mapping v)
   (for/set ([n (in-neighbors graph v)])
     (if (dict-has-key? current-mapping n)
         (dict-ref current-mapping n)
         -1)))
 
-(define (color-graph-update-mapping graph current-mapping v)
+(define (color-graph-update-mapping graph current-mapping v locals-type)
   (dict-set
    current-mapping
    v
-   (get-mex-color (get-neighbor-colors graph current-mapping v))))
+   (match v
+     [(Var x) #:when (is-vector-type locals-type x)
+              (get-mex-heap-color (get-neighbor-colors graph current-mapping v))]
+     [_ (get-mex-color (get-neighbor-colors graph current-mapping v))])))
 
-(define (color-graph-recurse graph queue current-mapping)
+(define (color-graph-recurse graph queue current-mapping locals-type)
   (if
    (= (pqueue-count queue) 0)
    current-mapping
@@ -923,18 +940,19 @@
      (color-graph-recurse
       graph
       (color-graph-update-queue graph queue v)
-      (color-graph-update-mapping graph current-mapping v)))))
+      (color-graph-update-mapping graph current-mapping v locals-type)
+      locals-type))))
 
 ; Vertices are stored in priority queue as (vertex, priority)
 (define (color-graph-<= v1 v2)
   (>= (vector-ref v1 1) (vector-ref v2 1)))
 
 (define unassignable-register-mapping
-  (list (cons (ByteReg 'al) -10)
-        (cons (Reg 'rax) -1)
-        (cons (Reg 'r11) -2)
-        (cons (Reg 'r15) -3)
+  (list (cons (ByteReg 'al) -5)
         (cons (Reg 'rbp) -4)
+        (cons (Reg 'r15) -3)
+        (cons (Reg 'r11) -2)
+        (cons (Reg 'rax) -1)
         (cons (Reg 'rbx)  0)
         (cons (Reg 'rcx)  1)
         (cons (Reg 'rdx)  2)
@@ -950,13 +968,13 @@
 (define (get-vertex-priority graph v)
   (sequence-length (in-neighbors graph v)))
 
-(define (color-graph graph)
+(define (color-graph graph locals-type)
   (let* ([queue (make-pqueue color-graph-<=)])
     (for ([v (in-vertices graph)])
       (match v
         [(Reg _) void]
         [_ (pqueue-push! queue (vector v (get-vertex-priority graph v)))]))
-    (color-graph-recurse graph queue unassignable-register-mapping)))
+    (color-graph-recurse graph queue unassignable-register-mapping locals-type)))
 
 (define root-spill-stack-env (make-hash))
 
@@ -979,25 +997,21 @@
 (define (get-stack-loc color)
   (* -8 (+ (- color (length color-to-register-mapping)) 1)))
 
+(define (get-root-stack-loc color)
+  (* -8 (+ (- (+ color 6)) 1)))
+
+(define (spill-to-stack color)
+  (if (>= color 0)
+      (Deref 'rbp (get-stack-loc color))
+      (Deref 'r15 (get-root-stack-loc color))))
+
 (define (get-mapping-from-color color)
   (if (dict-has-key? color-to-register-mapping color)
       (dict-ref color-to-register-mapping color)
-      (Deref 'rbp (get-stack-loc color))))
-
-(define (get-mapping-from-color-root color)
-  (if (dict-has-key? color-to-register-mapping color)
-      (dict-ref color-to-register-mapping color)
-      (if (not (dict-has-key? root-spill-stack-env color))
-          (let ([_ (dict-set! root-spill-stack-env color (get-next-stack-loc-root))])
-            (Deref 'r15 (dict-ref root-spill-stack-env color)))
-          (Deref 'r15 (dict-ref root-spill-stack-env color)))))
+      (spill-to-stack color)))
 
 (define (allocate-registers-arg arg allocation locals-type)
   (match arg
-    ; Spilling should be done on root stack.
-    [(Var x) #:when (is-vector-type locals-type x)
-             (get-mapping-from-color-root (dict-ref allocation arg))]
-    ; Spilling should be done on stack.
     [(Var x) (get-mapping-from-color (dict-ref allocation arg))]
     [_ arg]))
 
@@ -1021,8 +1035,18 @@
   (match p
     [(X86Program info blocks)
      (let*
-         ([allocation (color-graph (dict-ref info 'conflicts))])
-       (X86Program info (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]))
+         ([allocation (color-graph (dict-ref info 'conflicts) (dict-ref info 'locals-types))]
+          [info-root
+            (dict-set
+              info
+              'num-root-spills
+              (max (- (+ 5 (apply min (map (lambda (x) (cdr x)) allocation)))) 0))]
+          [info-stack 
+            (dict-set
+              info-root
+              'num-stack-spills
+              (max (- (apply max (map (lambda (x) (cdr x)) allocation)) 11) 0))])
+       (X86Program info-stack (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]))
 
 (define (patch-instrs-list instrs)
   (match instrs
@@ -1065,32 +1089,28 @@
     [(X86Program info label-block-lst)
      (X86Program info (patch-instructions-blocks label-block-lst))]))
 
-; TODO: Fix stack frame size (Assumed to be 16?).
-;       Also take care of callq instructions stack thingy mentioned
-;       in chapter 3
-(define (generate-prelude)
+
+(define register-save-area 1)
+
+(define (generate-prelude stack-spills root-spills)
   (list (cons 'main (Block '()
                            (list (Instr 'pushq (list (Reg 'rbp)))
                                  (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                                 (Instr 'subq (list (Imm 32768) (Reg 'rsp)))
+                                 (Instr 'subq (list (Imm (align (* 8 (+ stack-spills register-save-area)) 16)) (Reg 'rsp)))
                                  (Instr 'movq (list (Imm 16384) (Reg 'rdi)))
                                  (Instr 'movq (list (Imm 16384) (Reg 'rsi)))
                                  (Callq 'initialize 2)
                                  (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15)))
                                  (Instr 'movq (list (Imm 0) (Deref 'r15 0)))
-                                 ; TODO: Change root  stack frame size here later.
-                                 (Instr 'addq (list (Imm (* 8 (hash-count root-spill-stack-env))) (Reg 'r15)))
+                                 (Instr 'addq (list (Imm (align (* 8 root-spills) 16)) (Reg 'r15)))
                                  (Jmp 'start))))))
 
-; TODO: Fix stack frame size (Assumed to be 16?).
-;       Also take care of callq instructions stack thingy mentioned
-;       in chapter 3
-(define (generate-conclusion)
+(define (generate-conclusion stack-spills root-spills)
   (list (cons
          'conclusion
          (Block '()
-                (list (Instr 'addq (list (Imm 32768) (Reg 'rsp)))
-                      (Instr 'subq (list (Imm (* 8 (hash-count root-spill-stack-env))) (Reg 'r15)))
+                (list (Instr 'addq (list (Imm (align (* 8 (+ stack-spills register-save-area)) 16)) (Reg 'rsp)))
+                      (Instr 'subq (list (Imm (align (* 8 root-spills) 16)) (Reg 'r15)))
                       (Instr 'popq (list (Reg 'rbp)))
                       (Retq))))))
 
@@ -1098,9 +1118,14 @@
 (define (prelude-and-conclusion p)
   (match p
     [(X86Program info blocks)
-     (X86Program info (append (generate-prelude)
+     (X86Program info (append (generate-prelude
+                               (dict-ref info 'num-stack-spills)
+                               (dict-ref info 'num-root-spills))
                               blocks
-                              (generate-conclusion)))]))
+                              (generate-conclusion
+                               (dict-ref info 'num-stack-spills)
+                               (dict-ref info 'num-root-spills))
+                              ))]))
 
 ;; Define the compiler passes to be used by interp-tests and the grader
 ;; Note that your compiler file (the file that defines the passes)
