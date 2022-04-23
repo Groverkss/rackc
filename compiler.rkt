@@ -3,12 +3,12 @@
 (require racket/fixnum)
 (require data/queue)
 (require graph)
-(require "interp-Lvec.rkt")
-(require "interp-Lvec-prime.rkt")
-(require "interp-Cvec.rkt")
+(require "interp-Lfun.rkt")
+(require "interp-Lfun-prime.rkt")
+(require "interp-Cfun.rkt")
 (require "interp.rkt")
-(require "type-check-Cvec.rkt")
-(require "type-check-Lvec.rkt")
+(require "type-check-Cfun.rkt")
+(require "type-check-Lfun.rkt")
 (require "priority_queue.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
@@ -85,12 +85,20 @@
     [(Begin es e) (Begin (for/list ([esp es]) (shrink-expr esp)) (shrink-expr e))]
     [(WhileLoop cnd e) (WhileLoop (shrink-expr cnd) (shrink-expr e))]
     [(HasType e type) (HasType (shrink-expr e) type)]
+    [(Apply fun args) (Apply (shrink-expr fun) (map shrink-expr args))]
     [_ exp]))
+
+(define (shrink-def def)
+  (match def
+    [(Def name param rty info body)
+      (Def name param rty info (shrink-expr body))]))
 
 (define (shrink p)
   (match p
-    [(Program info e)
-     (Program info (shrink-expr e))]))
+    [(ProgramDefsExp info defs body)
+      (let* 
+        ([main-fun (Def 'main '() 'Integer '() body)])
+      (ProgramDefs info (map shrink-def (append defs (list main-fun)))))]))
 
 (define (uniquify-exp env)
   (lambda (e)
@@ -113,18 +121,205 @@
       [(WhileLoop cnd e)
        (WhileLoop ((uniquify-exp env) cnd) ((uniquify-exp env) e))]
       [(HasType expr type) (HasType ((uniquify-exp env) expr) type)]
+      [(Apply fun args)
+       (Apply
+        ((uniquify-exp env) fun)
+        (for/list ([arg args]) ((uniquify-exp env) arg)))]
       [_ e])))
+
+(define (uniquify-def def env)
+  (match def
+    [(Def name params rty info body)
+     (define new-params
+      (for/list
+         ([param params])
+       (let ([param-name
+              (match param
+                [`(,x : ,t) x])])
+         (dict-set! env param-name (gensym param-name)))
+        (match param
+          [`(,x : ,t) (let ([x-new (dict-ref env x)]) `(,x-new : ,t))])))
+      (Def 
+        name 
+        new-params
+        rty 
+        info 
+        ((uniquify-exp env) body))]))
+
+(define (uniquify-defs defs env)
+  (for/list ([def defs]) (uniquify-def def env)))
 
 ;; uniquify : R1 -> R1
 (define (uniquify p)
+  (define (build-env defs)
+    (let* (
+           [def-names (map (lambda (x) (match x [(Def name _ _ _ _) name])) defs)]
+           [def-names-no-main (drop-right def-names 1)]
+           [env (make-hash)])
+      (for ([name def-names-no-main]) (dict-set! env name name))
+      env))
+  
   (match p
-    [(Program info e) (Program info ((uniquify-exp '()) e))]))
+    [(ProgramDefs info defs)
+     (let ([env (build-env defs)])
+       (ProgramDefs info (uniquify-defs defs env)))]))
+
+(define (reveal-functions-exp env)
+  (lambda (e)
+    (match e
+      [(Var x) (if (dict-has-key? env x)
+              (FunRef x (dict-ref env x))
+              (Var x))]
+      [(Let x e body)
+        (Let x
+        ((reveal-functions-exp env) e)
+        ((reveal-functions-exp env) body))]
+      [(Prim op es)
+       (Prim op (for/list ([e es]) ((reveal-functions-exp env) e)))]
+      [(If e1 e2 e3)
+       (If ((reveal-functions-exp env) e1) ((reveal-functions-exp env) e2) ((reveal-functions-exp env) e3))]
+      [(SetBang x e)
+       (SetBang x ((reveal-functions-exp env) e))]
+      [(Begin es e)
+       (Begin (for/list ([esp es]) ((reveal-functions-exp env) esp)) ((reveal-functions-exp env) e))]
+      [(WhileLoop cnd e)
+       (WhileLoop ((reveal-functions-exp env) cnd) ((reveal-functions-exp env) e))]
+      [(HasType expr type) (HasType ((reveal-functions-exp env) expr) type)]
+      [(Apply fun args)
+       (Apply
+        ((reveal-functions-exp env) fun)
+        (for/list ([arg args]) ((reveal-functions-exp env) arg)))]
+      [_ e])))
+
+(define (reveal-functions-defs defs function-info)
+  (map
+   (lambda (x)
+     (match x
+       [(Def name params rty info body)
+        (Def name params rty info ((reveal-functions-exp function-info) body))]))
+   defs))
+
+(define (reveal-functions p)
+  (match p
+    [(ProgramDefs info defs)
+     (let ([function-info
+            (map
+             (lambda (x)
+               (match x
+                 [(Def name params _ _ _) (cons name (length params))]))
+             defs)])
+       (ProgramDefs info (reveal-functions-defs defs function-info)))]))
+
+(define (limit-body-apply args)
+  (match args
+    [(list p1 p2 p3 p4 p5 ps ..2)
+      (list p1 p2 p3 p4 p5 (Prim 'vector ps))]
+    [_ args]))
+
+(define (limit-body env)
+  (lambda (e)
+    (match e
+      [(Var x) (if (dict-has-key? env x)
+              (dict-ref env x)
+              (Var x))]
+      [(FunRef x n) (if (dict-has-key? env x)
+              (dict-ref env x)
+              (FunRef x n))]
+      [(Let x e body)
+        (Let x
+        ((limit-body env) e)
+        ((limit-body env) body))]
+      [(Prim op es)
+       (Prim op (for/list ([e es]) ((limit-body env) e)))]
+      [(If e1 e2 e3)
+       (If ((limit-body env) e1) ((limit-body env) e2) ((limit-body env) e3))]
+      [(SetBang x e)
+       (SetBang x ((limit-body env) e))]
+      [(Begin es e)
+       (Begin (for/list ([esp es]) ((limit-body env) esp)) ((limit-body env) e))]
+      [(WhileLoop cnd e)
+       (WhileLoop ((limit-body env) cnd) ((limit-body env) e))]
+      [(HasType expr type) (HasType ((limit-body env) expr) type)]
+      [(Apply fun args)
+       (Apply
+        ((limit-body env) fun)
+        (map (limit-body env) (limit-body-apply args)))]
+      [_ e])))
+
+(define (get-name-from-param param)
+  (match param
+    [`(,x : ,t) x]))
+
+(define (limit-body-create-env params vector-name)
+  (match params
+    [(list p1 p2 p3 p4 p5 ps ..2)
+      (for/list 
+        ([i (in-range 0 (length ps))]
+         [p ps])
+        (cons 
+          (get-name-from-param p)
+          (Prim 'vector-ref (list (Var vector-name) (Int i)))))]
+    [_ '()]))
+
+(define (build-type-from-params params)
+  (cons
+   'Vector
+   (map
+    (lambda (x)
+      (match x
+        [`(,x : ,typ) typ]))
+    params)))
+
+(define (limit-types typ)
+  (match typ
+    [(list args ... '-> result ...)
+     (append
+      (limit-types
+       (match args
+         [(list p1 p2 p3 p4 p5 ps ..2)
+          (list p1 p2 p3 p4 p5 (cons 'Vector ps))]
+         [_ args]))
+      (list '->)
+      (limit-types result))]
+    [(list args ...) (map limit-types args)]
+    [_ typ]))
+
+(define (limit-params params vector-name)
+  (let
+      ([args (match params
+               [(list p1 p2 p3 p4 p5 ps ..2)
+                (list p1 p2 p3 p4 p5 `(,vector-name : ,(build-type-from-params ps)))]
+               [_ params])])
+    (map
+     (lambda (arg)
+       (match arg
+         [`(,arg : ,typ)
+          `(,arg : ,(limit-types typ))]))
+     args)))
+
+(define (limit-defs defs)
+  (map (lambda (def)
+         (let ([vector-name (gensym 'param-vector)])
+           (match def
+             [(Def name params rty info body)
+              (Def
+               name
+               (limit-params params vector-name)
+               (limit-types rty)
+               info
+               ((limit-body (limit-body-create-env params vector-name)) body))])))
+       defs))
+
+(define (limit-functions p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs info (limit-defs defs))]))
 
 (define (wrap-lets args arg-vars cont)
   (match arg-vars
     ['() cont]
     [(list var more ...)
-    (Let var (car args)
+     (Let var (car args)
           (wrap-lets (cdr args) more cont))]))
 
 (define (make-prim op . exp*)
@@ -149,7 +344,7 @@
 (define (expose-allocation-exp exp)
   (match exp
     [(Prim op args)
-     (Prim op (for/list ([arg args]) (expose-allocation-exp arg)))]
+     (Prim op (map expose-allocation-exp args))]
     [(Let x e t)
      (Let x (expose-allocation-exp e) (expose-allocation-exp t))]
     [(If e1 e2 e3)
@@ -157,12 +352,14 @@
     [(SetBang x e) (SetBang x (expose-allocation-exp e))]
     [(Begin es e) (Begin (for/list ([esp es]) (expose-allocation-exp esp)) (expose-allocation-exp e))]
     [(WhileLoop cnd e) (WhileLoop (expose-allocation-exp cnd) (expose-allocation-exp e))]
+    [(Apply fun args)
+     (Apply (expose-allocation-exp fun) (map expose-allocation-exp args))]
 
     ; (has-type (vector e0 ... e_{n-1}) type)
     [(HasType (Prim 'vector args) type)
      (define new-args
-      (for/list ([arg args])
-        (expose-allocation-exp arg)))
+       (for/list ([arg args])
+         (expose-allocation-exp arg)))
      (define arg-vars (for/list ([arg new-args]) (gensym 'vecarg)))
      (define vector-name (gensym 'vector))
      (define len (* 8 (length new-args)))
@@ -181,17 +378,25 @@
 
 (define (expose-allocation p)
   (match p
-    [(Program info e) (Program info (expose-allocation-exp e))]))
+    [(ProgramDefs info defs)
+      (ProgramDefs info 
+        (map 
+          (lambda (def) 
+            (match def
+              [(Def name params rty info body)
+                (Def name params rty info (expose-allocation-exp body))])) 
+          defs))]))
 
 (define (collect-set! e)
   (match e
     [(Var x) (set)]
+    [(FunRef x n) (set)]
     [(Int x) (set)]
     [(Bool x) (set)]
     [(Void) (set)]
     [(Allocate _ _) (set)]
-    [(GlobalValue _) (set)] 
-    [(Collect _) (set)] 
+    [(GlobalValue _) (set)]
+    [(Collect _) (set)]
     [(Prim op args)
      (foldr (lambda (x v) (set-union v (collect-set! x))) (set) args)]
     [(Let x e t) (set-union (collect-set! e) (collect-set! t))]
@@ -201,7 +406,11 @@
     [(Begin es e)
      (foldr (lambda (x v) (set-union v (collect-set! x))) (collect-set! e) es)]
     [(WhileLoop cnd e) (set-union (collect-set! cnd) (collect-set! e))]
-    [(HasType expr _) (collect-set! expr)]))
+    [(HasType expr _) (collect-set! expr)]
+    [(Apply fun args)
+     (set-union
+      (collect-set! fun)
+      (foldr (lambda (x v) (set-union v (collect-set! x))) (set) args))]))
 
 (define (uncover-get!-exp set!-vars exp)
   (match exp
@@ -209,12 +418,16 @@
      (if (set-member? set!-vars x)
          (GetBang x)
          (Var x))]
+    [(FunRef x n)
+     (if (set-member? set!-vars x)
+         (GetBang x)
+         (FunRef x n))]
     [(Int x) exp]
     [(Bool x) exp]
     [(Void) exp]
     [(Allocate _ _) exp]
-    [(GlobalValue _) exp] 
-    [(Collect _) exp] 
+    [(GlobalValue _) exp]
+    [(Collect _) exp]
     [(Prim op args)
      (Prim op
            (for/list ([arg args])
@@ -238,13 +451,24 @@
      (WhileLoop
       (uncover-get!-exp set!-vars cnd)
       (uncover-get!-exp set!-vars e))]
-    [(HasType expr type) (HasType (uncover-get!-exp set!-vars expr) type)]))
+    [(HasType expr type) (HasType (uncover-get!-exp set!-vars expr) type)]
+    [(Apply fun args)
+     (Apply 
+      (uncover-get!-exp set!-vars fun)
+           (for/list ([arg args])
+             (uncover-get!-exp set!-vars arg)))]))
 
 ;; uncover-get! : Replace uses of mutable variables with (get! var)
 (define (uncover-get! p)
   (match p
-    [(Program info e)
-     (Program info  (uncover-get!-exp (collect-set! e) e))]))
+    [(ProgramDefs info defs)
+      (ProgramDefs info 
+        (map 
+          (lambda (def) 
+            (match def
+              [(Def name params rty info body)
+                (Def name params rty info (uncover-get!-exp (collect-set! body) body))])) 
+          defs))]))
 
 ; Given a list of expressions, build atoms from the and collect their
 ; environment. Returns (list (list atoms), environment).
@@ -293,7 +517,9 @@
     [(WhileLoop cnd exp) (create-as-tmp-exp ast)]
     [(Collect _) (create-as-tmp-exp ast)]
     [(Allocate _ _) (create-as-tmp-exp ast)]
-    [(GlobalValue _) (create-as-tmp-exp ast)]))
+    [(GlobalValue _) (create-as-tmp-exp ast)]
+    [(Apply _ _) (create-as-tmp-exp ast)]
+    [(FunRef _ _) (create-as-tmp-exp ast)]))
 
 (define (create-let-from-env env body)
   (match env
@@ -306,6 +532,7 @@
 (define (rco-exp ast)
   (match ast
     [(Var x) ast]
+    [(FunRef x n) ast]
     [(Int x) ast]
     [(Bool x) ast]
     [(Void) ast]
@@ -325,12 +552,26 @@
       (for/list ([exp-atm exp-lst])
         (rco-exp exp-atm))
       (rco-exp exp))]
-    [(WhileLoop cnd exp) (WhileLoop (rco-exp cnd) (rco-exp exp))]))
+    [(WhileLoop cnd exp) (WhileLoop (rco-exp cnd) (rco-exp exp))]
+    [(Apply fun args)
+     (match (collect-env args)
+       [(list atm-list env)
+        (match
+            (collect-env (list fun))
+          [(list (list fun-atm) fun-env)
+           (create-let-from-env (append env fun-env) (Apply fun-atm atm-list))])])]))
 
 ; remove-complex-opera* : R1 -> R1
 (define (remove-complex-opera* p)
   (match p
-    [(Program info e) (Program info (rco-exp e))]))
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name params rty info (rco-exp body))]))
+                   defs))]))
 
 (define basic-blocks '())
 
@@ -477,6 +718,17 @@
   (match p
     [(Program info body)
      (CProgram info (cons (cons 'start (explicate-tail body)) basic-blocks))]))
+
+; (define (remove-complex-opera* p)
+;   (match p
+;     [(ProgramDefs info defs)
+;       (ProgramDefs info
+;         (map
+;           (lambda (def)
+;             (match def
+;               [(Def name params rty info body)
+;                 (Def name params rty info (rco-exp body))]))
+;           defs))]))
 
 (define (select-atm atm)
   (match atm
@@ -664,18 +916,18 @@
 
 ; Assumes that the registers used for Deref are either %rax or %r11.
 (define (sanitize-locations->set . atm*)
-  (list->set 
-    (filter
-      (lambda (x)
-        (match x
-          [(Var _) #t]
-          [(Reg _) #t]
-          [(ByteReg _) #t]
-          [(Imm _) #f]
-          [(Deref _ _) #f]
-          [(Global _) #f]))
-        atm*)))
-  
+  (list->set
+   (filter
+    (lambda (x)
+      (match x
+        [(Var _) #t]
+        [(Reg _) #t]
+        [(ByteReg _) #t]
+        [(Imm _) #f]
+        [(Deref _ _) #f]
+        [(Global _) #f]))
+    atm*)))
+
 ;; Get all write locations from an instruction.
 (define (get-write-locations instr)
   (match instr
@@ -820,9 +1072,9 @@
 
 (define (is-vector-type locals-type var)
   (dict-has-key? locals-type var)
-      (match (dict-ref locals-type var)
-        [(list 'Vector _ ...) #t]
-        [_ #f]))
+  (match (dict-ref locals-type var)
+    [(list 'Vector _ ...) #t]
+    [_ #f]))
 
 (define (build-interference-instr L_afterk instr graph locals-type)
   (add-vertices-interference! instr graph)
@@ -1037,15 +1289,15 @@
      (let*
          ([allocation (color-graph (dict-ref info 'conflicts) (dict-ref info 'locals-types))]
           [info-root
-            (dict-set
-              info
-              'num-root-spills
-              (max (- (+ 5 (apply min (map (lambda (x) (cdr x)) allocation)))) 0))]
-          [info-stack 
-            (dict-set
-              info-root
-              'num-stack-spills
-              (max (- (apply max (map (lambda (x) (cdr x)) allocation)) 11) 0))])
+           (dict-set
+            info
+            'num-root-spills
+            (max (- (+ 5 (apply min (map (lambda (x) (cdr x)) allocation)))) 0))]
+          [info-stack
+           (dict-set
+            info-root
+            'num-stack-spills
+            (max (- (apply max (map (lambda (x) (cdr x)) allocation)) 11) 0))])
        (X86Program info-stack (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]))
 
 (define (patch-instrs-list instrs)
@@ -1131,17 +1383,19 @@
 ;; Note that your compiler file (the file that defines the passes)
 ;; must be named "compiler.rkt"
 (define compiler-passes
-  `(("reset global" ,reset-global, interp-Lvec ,type-check-Lvec)
-    ("shrink" ,shrink, interp-Lvec ,type-check-Lvec)
-    ("uniquify" ,uniquify ,interp-Lvec ,type-check-Lvec)
-    ("expose allocation" ,expose-allocation ,interp-Lvec-prime ,type-check-Lvec)
-    ("uncover get!" ,uncover-get!, interp-Lvec-prime ,type-check-Lvec)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvec-prime ,type-check-Lvec)
-    ("explicate control" ,explicate-control ,interp-Cvec ,type-check-Cvec)
-    ("instruction selection" ,select-instructions #f)
-    ("uncover live" ,uncover-live #f)
-    ("build interference graph" ,build-interference #f)
-    ("allocate registers" ,allocate-registers #f)
-    ("patch instructions" ,patch-instructions #f)
-    ("prelude-and-conclusion" ,prelude-and-conclusion #f)
+  `(("reset global" ,reset-global ,interp-Lfun ,type-check-Lfun)
+    ("shrink" ,shrink ,interp-Lfun ,type-check-Lfun)
+    ("uniquify" ,uniquify ,interp-Lfun ,type-check-Lfun)
+    ("reveal functions" ,reveal-functions ,interp-Lfun-prime ,type-check-Lfun)
+    ("limit functions" ,limit-functions ,interp-Lfun-prime ,type-check-Lfun)
+    ("expose allocation" ,expose-allocation ,interp-Lfun-prime ,type-check-Lfun)
+    ("uncover get!" ,uncover-get!, interp-Lfun-prime ,type-check-Lfun)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lfun-prime ,type-check-Lfun)
+    ; ("explicate control" ,explicate-control ,interp-Cvec ,type-check-Cvec)
+    ; ("instruction selection" ,select-instructions #f)
+    ; ("uncover live" ,uncover-live #f)
+    ; ("build interference graph" ,build-interference #f)
+    ; ("allocate registers" ,allocate-registers #f)
+    ; ("patch instructions" ,patch-instructions #f)
+    ; ("prelude-and-conclusion" ,prelude-and-conclusion #f)
     ))
