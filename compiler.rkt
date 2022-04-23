@@ -62,7 +62,6 @@
   (set! basic-blocks '())
   (set! labels->live (make-hash))
   (set! labels->blocks (make-hash))
-  (set! root-spill-stack-env (make-hash))
   p)
 
 ;; shrink : R1 -> R1
@@ -1227,11 +1226,6 @@
         [(Reg _) void]
         [_ (pqueue-push! queue (vector v (get-vertex-priority graph v)))]))
     (color-graph-recurse graph queue unassignable-register-mapping locals-type)))
-
-(define root-spill-stack-env (make-hash))
-
-(define (get-next-stack-loc-root)
-  (* -8 (+ (hash-count root-spill-stack-env) 1)))
 
 (define color-to-register-mapping
   (list (cons  0  (Reg 'rbx))
