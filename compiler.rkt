@@ -59,7 +59,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (reset-global p)
-  (set! basic-blocks '())
   (set! labels->live (make-hash))
   (set! labels->blocks (make-hash))
   p)
@@ -592,6 +591,7 @@
 (define (explicate-effect e cont)
   (match e
     [(Var x) cont]
+    [(FunRef x n) cont]
     [(Int n) cont]
     [(Bool n) cont]
     [(Void) cont]
@@ -622,6 +622,7 @@
      (let ([cont-body (explicate-effect body cont)])
        (foldr explicate-effect cont-body es))]
     [(SetBang var rhs) (explicate-assign rhs var cont)]
+    [(Apply fun args) (Seq (Call fun args) cont)]
     [else (error "explicate-effect unhandled case" e)]))
 
 ; `thn`, `els` are assumed to be tails i.e. they are
@@ -640,6 +641,18 @@
                   (IfStmt (Prim op es)
                           (create-block thn)
                           (create-block els))]
+    [(Prim op args)
+     (let ([tmp-var (create-tmp-var)])
+        (explicate-assign cnd tmp-var
+                          (IfStmt (Prim 'eq? (list (Var tmp-var) (Bool #t)))
+                                  (create-block thn)
+                                  (create-block els))))]
+    [(Apply fun args)
+     (let ([tmp-var (create-tmp-var)])
+        (explicate-assign cnd tmp-var
+                          (IfStmt (Prim 'eq? (list (Var tmp-var) (Bool #t)))
+                                  (create-block thn)
+                                  (create-block els))))]
     [(Bool b) (if b thn els)]
     ; Push cnd^ up and use thn^ and els^ as conditions for branches.
     [(If cnd^ thn^ els^)
@@ -654,6 +667,7 @@
 (define (explicate-tail e)
   (match e
     [(Var x) (Return (Var x))]
+    [(FunRef x n) (Return (FunRef x n))]
     [(Int n) (Return (Int n))]
     [(Bool n) (Return (Bool n))]
     [(Void) (Return (Void))]
@@ -677,11 +691,13 @@
      (let ([tail-body (explicate-tail body)])
        (foldr explicate-effect tail-body es))]
     [(SetBang var rhs) (explicate-assign rhs var (Return (Void)))]
+    [(Apply fun args) (TailCall fun args)]
     [else (error "explicate-tail unhandled case" e)]))
 
 (define (explicate-assign e x cont)
   (match e
     [(Var y) (Seq (Assign (Var x) (Var y)) cont)]
+    [(FunRef y n) (Seq (Assign (Var x) (FunRef y n)) cont)]
     [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
     [(Bool n) (Seq (Assign (Var x) (Bool n)) cont)]
     [(Void) (Seq (Assign (Var x) (Void)) cont)]
@@ -710,24 +726,27 @@
      (let ([cont-body (explicate-assign body x cont)])
        (foldr explicate-effect cont-body es))]
     [(SetBang var rhs) (explicate-assign rhs var (Seq (Assign (Var x) (Void)) cont))]
+    [(Apply fun args) (Seq (Assign (Var x) (Call fun args)) cont)]
     [else (error "explicate-assign unhandled case" e)]))
 
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
   (match p
-    [(Program info body)
-     (CProgram info (cons (cons 'start (explicate-tail body)) basic-blocks))]))
-
-; (define (remove-complex-opera* p)
-;   (match p
-;     [(ProgramDefs info defs)
-;       (ProgramDefs info
-;         (map
-;           (lambda (def)
-;             (match def
-;               [(Def name params rty info body)
-;                 (Def name params rty info (rco-exp body))]))
-;           defs))]))
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (set! basic-blocks '())
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name params rty info
+                             (cons
+                              (cons
+                               (string->symbol
+                                (string-append (symbol->string name) "start"))
+                               (explicate-tail body))
+                              basic-blocks))]))
+                   defs))]))
 
 (define (select-atm atm)
   (match atm
@@ -1385,7 +1404,7 @@
     ("expose allocation" ,expose-allocation ,interp-Lfun-prime ,type-check-Lfun)
     ("uncover get!" ,uncover-get!, interp-Lfun-prime ,type-check-Lfun)
     ("remove complex opera*" ,remove-complex-opera* ,interp-Lfun-prime ,type-check-Lfun)
-    ; ("explicate control" ,explicate-control ,interp-Cvec ,type-check-Cvec)
+    ("explicate control" ,explicate-control ,interp-Cfun ,type-check-Cfun)
     ; ("instruction selection" ,select-instructions #f)
     ; ("uncover live" ,uncover-live #f)
     ; ("build interference graph" ,build-interference #f)
