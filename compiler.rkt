@@ -58,11 +58,6 @@
 ;; HW1 Passes
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (reset-global p)
-  (set! labels->live (make-hash))
-  (set! labels->blocks (make-hash))
-  p)
-
 ;; shrink : R1 -> R1
 ;; Remove `and` and `or` from the language.
 (define (shrink-expr exp)
@@ -100,6 +95,7 @@
 
 (define (uniquify-exp env)
   (lambda (e)
+    (println e)
     (match e
       [(Var x) (Var (dict-ref env x))]
       [(Let x e body)
@@ -653,6 +649,15 @@
                           (IfStmt (Prim 'eq? (list (Var tmp-var) (Bool #t)))
                                   (create-block thn)
                                   (create-block els))))]
+    [(Begin es body)
+     (let* ([tmp-var (create-tmp-var)]
+            [tail-body
+             (explicate-assign
+              body
+              tmp-var
+              (explicate-pred (Var tmp-var) thn els))])
+       (foldr explicate-effect tail-body es))]
+
     [(Bool b) (if b thn els)]
     ; Push cnd^ up and use thn^ and els^ as conditions for branches.
     [(If cnd^ thn^ els^)
@@ -729,6 +734,12 @@
     [(Apply fun args) (Seq (Assign (Var x) (Call fun args)) cont)]
     [else (error "explicate-assign unhandled case" e)]))
 
+(define (create-start-block-label name)
+  (string->symbol (string-append (symbol->string name) "start")))
+
+(define (create-conclude-block-label name)
+  (string->symbol (string-append (symbol->string name) "conclude")))
+
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
   (match p
@@ -742,8 +753,7 @@
                         (Def name params rty info
                              (cons
                               (cons
-                               (string->symbol
-                                (string-append (symbol->string name) "start"))
+                               (create-start-block-label name)
                                (explicate-tail body))
                               basic-blocks))]))
                    defs))]))
@@ -790,11 +800,17 @@
                (arithmetic-shift len 1)
                (arithmetic-shift (type-mask type) 7)))
 
+(define (convert-to-regs names) (for/list ([reg names]) (Reg reg)))
+(define function-call-list (convert-to-regs (list 'rdi 'rsi 'rdx 'rcx 'r8 'r9)))
+
 (define (select-assign x e)
   (match e
     ; movq e, x
     [atm #:when (atm? atm)
          (list (Instr 'movq (list (select-atm atm) x)))]
+
+    [(FunRef fun airty)
+     (list (Instr 'leaq (list (FunRef fun airty) x)))]
 
     [(GlobalValue var)
      (list
@@ -867,6 +883,11 @@
       (Instr 'movq (list (Imm (calculate-tag len type)) (Deref 'r11 0)))
       (Instr 'movq (list (Reg 'r11) (select-atm x))))]
 
+    [(Call fun args)
+     (append
+      (select-stmt e)
+      (list (Instr 'movq (list (Reg 'rax) x))))]
+
     [else (error "select-assign unhandled case" e)]))
 
 (define (select-stmt stmt)
@@ -884,6 +905,12 @@
       (Instr 'movq (list (Reg 'r15) (Reg 'rdi)))
       (Instr 'movq (list (Imm size) (Reg 'rsi)))
       (Callq 'collect 2))]
+    [(Call fun args)
+     (append
+      (for/list ([reg function-call-list]
+                 [arg args])
+        (Instr 'movq (list (select-atm arg) reg)))
+      (list (IndirectCallq fun (length args))))]
     [else (error "select-stmt unhandled case" stmt)]))
 
 (define (get-cmp-cnd op)
@@ -908,27 +935,50 @@
              (JmpIf (get-cmp-cnd op) label1)
              (Jmp label2))])))
 
+(define function-name null)
+
 (define (select-tail t)
   (match t
-    [(Return x) (append (select-stmt t) (list (Jmp 'conclusion)))]
+    [(Return x) (append (select-stmt t) (list (Jmp (create-conclude-block-label function-name))))]
     [(Seq assign tail) (append (select-stmt assign) (select-tail tail))]
     [(Goto label) (list (Jmp label))]
     [(IfStmt cnd thn els) (select-if cnd thn els)]
+    [(TailCall fun args)
+     (append
+      (for/list ([reg function-call-list]
+                 [arg args])
+        (Instr 'movq (list (select-atm arg) reg)))
+      (list (TailJmp fun (length args))))]
     [else (error "select-tail unhandled case" t)]))
+
+(define (select-block params name)
+  (set! function-name name)
+  (lambda (x)
+    (let ([call-list
+           (if (eq? (car x) (create-start-block-label name))
+               (for/list ([reg function-call-list]
+                          [param params])
+                 (Instr 'movq (list reg (Var (car param)))))
+               '())])
+      (cons (car x) (Block '() (append call-list (select-tail (cdr x))))))))
 
 ;; select-instructions : C0 -> pseudo-x86
 (define (select-instructions p)
   (match p
-    [(CProgram info tails)
-     (X86Program info (for/list ([tail tails])
-                        (match tail
-                          [(cons label t)
-                           (cons label (Block '() (select-tail t)))])))]))
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name '() 'Integer (dict-set info 'num-params (length params))
+                             (map
+                              (select-block params name)
+                              body))]))
+                   defs))]))
 
-(define (convert-to-regs names) (for/list ([reg names]) (Reg reg)))
 (define caller-saved-list (convert-to-regs (list 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)))
 (define callee-saved-list (convert-to-regs (list 'rsp 'rbp 'rbx 'r12 'r13 'r14 'r15)))
-(define function-call-list (convert-to-regs (list 'rdi 'rsi 'rdx 'rcx 'r8 'r9)))
 (define labels->live (make-hash))
 (define labels->blocks (make-hash))
 
@@ -941,6 +991,7 @@
         [(Var _) #t]
         [(Reg _) #t]
         [(ByteReg _) #t]
+        [(FunRef _ _) #f]
         [(Imm _) #f]
         [(Deref _ _) #f]
         [(Global _) #f]))
@@ -954,6 +1005,8 @@
     [(Instr _ `(,arg1 ,arg2)) (sanitize-locations->set arg2)]
     [(Instr _ `(,arg1)) (sanitize-locations->set arg1)]
     [(Callq _ _) (list->set caller-saved-list)]
+    [(IndirectCallq _ _) (list->set caller-saved-list)]
+    [(TailJmp _ _) (list->set caller-saved-list)]
     [(Jmp _) (set)]
     [(JmpIf _ _) (set)]
     [_ (error "Unimplemented instruction" instr)]))
@@ -968,6 +1021,8 @@
      [(Instr _ (list arg1 arg2)) (sanitize-locations->set arg1 arg2)]
      [(Instr _ (list arg1)) (sanitize-locations->set arg1)]
      [(Callq _ airty) (list->set (take function-call-list airty))]
+     [(IndirectCallq _ airty) (list->set (take function-call-list airty))]
+     [(TailJmp _ airty) (list->set (take function-call-list airty))]
      [(Jmp _) (set)]
      [(JmpIf _ _) (set)]
      [_ (error "Unimplemented instruction?" instr)])
@@ -1046,31 +1101,40 @@
                   (enqueue! worklist v))]))
   mapping)
 
-(define (liveness-transfer label live->after)
-  (if (eq? label 'conclusion)
+(define (liveness-transfer name)
+  (lambda (label live->after) 
+    (if (eq? label (create-conclude-block-label name))
       (set)
       (let* ([blk (dict-ref labels->blocks label)]
              [update-blk (liveness-analysis-block blk label live->after)])
         (dict-set! labels->blocks label update-blk)
-        (dict-ref labels->live label))))
+        (dict-ref labels->live label)))))
 
 ;; Given a list of (cons label block), do liveness analysis.
-(define (liveness-analysis-blocks label-block-lst)
+(define (liveness-analysis-blocks label-block-lst name)
+  (set! labels->live (make-hash))
+  (set! labels->blocks (make-hash))
   (let* ([cfg (transpose (build-liveness-cfg label-block-lst))])
     ; Set label -> block mapping in labels->blocks
     (for ([label-block label-block-lst])
       (match label-block
         [(cons label block) (dict-set! labels->blocks label block)]))
     ; Run dataflow analysis
-    (analyze_dataflow cfg liveness-transfer (set) set-union)
+    (analyze_dataflow cfg (liveness-transfer name) (set) set-union)
     ; Return blocks with liveness set
     (hash->list labels->blocks)))
 
 ;; Uncover live pass : Analysis to find live variables.
 (define (uncover-live p)
   (match p
-    [(X86Program info label-block-lst)
-     (X86Program info (liveness-analysis-blocks label-block-lst))]))
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name params rty info (liveness-analysis-blocks body name))]))
+                   defs))]))
 
 ; Add conflicts between set1 and set2
 (define (add-interference set1 set2 graph)
@@ -1396,8 +1460,7 @@
 ;; Note that your compiler file (the file that defines the passes)
 ;; must be named "compiler.rkt"
 (define compiler-passes
-  `(("reset global" ,reset-global ,interp-Lfun ,type-check-Lfun)
-    ("shrink" ,shrink ,interp-Lfun ,type-check-Lfun)
+  `(("shrink" ,shrink ,interp-Lfun ,type-check-Lfun)
     ("uniquify" ,uniquify ,interp-Lfun ,type-check-Lfun)
     ("reveal functions" ,reveal-functions ,interp-Lfun-prime ,type-check-Lfun)
     ("limit functions" ,limit-functions ,interp-Lfun-prime ,type-check-Lfun)
@@ -1405,8 +1468,8 @@
     ("uncover get!" ,uncover-get!, interp-Lfun-prime ,type-check-Lfun)
     ("remove complex opera*" ,remove-complex-opera* ,interp-Lfun-prime ,type-check-Lfun)
     ("explicate control" ,explicate-control ,interp-Cfun ,type-check-Cfun)
-    ; ("instruction selection" ,select-instructions #f)
-    ; ("uncover live" ,uncover-live #f)
+    ("instruction selection" ,select-instructions #f)
+    ("uncover live" ,uncover-live #f)
     ; ("build interference graph" ,build-interference #f)
     ; ("allocate registers" ,allocate-registers #f)
     ; ("patch instructions" ,patch-instructions #f)
