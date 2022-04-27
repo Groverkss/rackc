@@ -95,7 +95,6 @@
 
 (define (uniquify-exp env)
   (lambda (e)
-    (println e)
     (match e
       [(Var x) (Var (dict-ref env x))]
       [(Let x e body)
@@ -138,7 +137,7 @@
         new-params
         rty 
         info 
-        ((uniquify-exp env) body))]))
+        ((uniquify-exp (hash->list env)) body))]))
 
 (define (uniquify-defs defs env)
   (for/list ([def defs]) (uniquify-def def env)))
@@ -738,7 +737,7 @@
   (string->symbol (string-append (symbol->string name) "start")))
 
 (define (create-conclude-block-label name)
-  (string->symbol (string-append (symbol->string name) "conclude")))
+  (string->symbol (string-append (symbol->string name) "conclusion")))
 
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
@@ -810,7 +809,7 @@
          (list (Instr 'movq (list (select-atm atm) x)))]
 
     [(FunRef fun airty)
-     (list (Instr 'leaq (list (FunRef fun airty) x)))]
+     (list (Instr 'leaq (list (Global fun) x)))]
 
     [(GlobalValue var)
      (list
@@ -1021,8 +1020,10 @@
      [(Instr _ (list arg1 arg2)) (sanitize-locations->set arg1 arg2)]
      [(Instr _ (list arg1)) (sanitize-locations->set arg1)]
      [(Callq _ airty) (list->set (take function-call-list airty))]
-     [(IndirectCallq _ airty) (list->set (take function-call-list airty))]
-     [(TailJmp _ airty) (list->set (take function-call-list airty))]
+     [(IndirectCallq target airty) 
+      (set-union (sanitize-locations->set target) (list->set (take function-call-list airty)))]
+     [(TailJmp target airty) 
+      (set-union (sanitize-locations->set target) (list->set (take function-call-list airty)))]
      [(Jmp _) (set)]
      [(JmpIf _ _) (set)]
      [_ (error "Unimplemented instruction?" instr)])
@@ -1041,6 +1042,8 @@
      (list live->after live->after)]
     ; jmp -> use labels->live
     [(list (Jmp target))
+     (list live->after)]
+    [(list (TailJmp _ _))
      (list live->after)]
     ; Base case.
     [(list _ instrk+1 _ ...)
@@ -1064,7 +1067,7 @@
         instrs))]))
 
 ;; Given a list of (cons label block), build a CFG.
-(define (build-liveness-cfg label-block-lst)
+(define (build-liveness-cfg label-block-lst name)
   (let ([cfg (directed-graph '())])
     ; Traverse through all blocks.
     (for ([label-block label-block-lst])
@@ -1078,6 +1081,7 @@
                 ; For each instruction add edge in CFG for a jump.
                 [(JmpIf _ target) (add-directed-edge! cfg label target)]
                 [(Jmp target) (add-directed-edge! cfg label target)]
+                [(TailJmp _ _) (add-directed-edge! cfg label (create-conclude-block-label name))]
                 [_ null]))])]))
     cfg))
 
@@ -1114,7 +1118,7 @@
 (define (liveness-analysis-blocks label-block-lst name)
   (set! labels->live (make-hash))
   (set! labels->blocks (make-hash))
-  (let* ([cfg (transpose (build-liveness-cfg label-block-lst))])
+  (let* ([cfg (transpose (build-liveness-cfg label-block-lst name))])
     ; Set label -> block mapping in labels->blocks
     (for ([label-block label-block-lst])
       (match label-block
@@ -1184,6 +1188,34 @@
       callee-saved-list
       graph)
      ]
+    [(IndirectCallq _ _)
+     (let* ([write-locs (get-write-locations instr)]
+            [filtered_L (set-subtract L_afterk write-locs)])
+       (add-interference filtered_L write-locs graph))
+     (define (get-label var)
+       (match var [(Var x) x] [_ null]))
+     (add-interference
+      (for/set ([var (set->list L_afterk)]
+                #:when (and (not (null? (get-label var)))
+                            (is-vector-type locals-type (get-label var))))
+        var)
+      callee-saved-list
+      graph)
+     ]
+    [(TailJmp _ _)
+     (let* ([write-locs (get-write-locations instr)]
+            [filtered_L (set-subtract L_afterk write-locs)])
+       (add-interference filtered_L write-locs graph))
+     (define (get-label var)
+       (match var [(Var x) x] [_ null]))
+     (add-interference
+      (for/set ([var (set->list L_afterk)]
+                #:when (and (not (null? (get-label var)))
+                            (is-vector-type locals-type (get-label var))))
+        var)
+      callee-saved-list
+      graph)
+     ]
     ; For any other instruction, (d, v) \forall d \in write(instr) v \in L_afterk | v != d
     [_
      (let* ([write-locs (get-write-locations instr)]
@@ -1212,16 +1244,25 @@
 ;; Build Interference Graph : Analysis to find register conflicts.
 (define (build-interference p)
   (match p
-    [(X86Program info blocks)
-     (X86Program
-      (dict-set
-       info
-       'conflicts
-       (build-interference-blocks
-        blocks
-        (undirected-graph '())
-        (dict-ref info 'locals-types)))
-      blocks)]))
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def 
+                          name 
+                          params 
+                          rty 
+                          (dict-set 
+                            info 
+                            'conflicts 
+                            (build-interference-blocks 
+                              body 
+                              (undirected-graph '()) 
+                              (dict-ref info 'locals-types))) 
+                          body)]))
+                   defs))]))
 
 ; TODO: Update priority of graph neighbours.
 (define (color-graph-update-queue graph queue v) queue)
@@ -1351,6 +1392,14 @@
       [(Instr name args)
        (Instr name (for/list ([arg args])
                      (allocate-registers-arg arg allocation locals-type)))]
+      [(IndirectCallq name arity)
+       (IndirectCallq 
+        (allocate-registers-arg name allocation locals-type) 
+        arity)]
+      [(TailJmp name arity)
+       (TailJmp 
+        (allocate-registers-arg name allocation locals-type) 
+        arity)]
       [_ instr])))
 
 (define (allocate-registers-blocks blocks allocation locals-type)
@@ -1362,99 +1411,166 @@
 ;; Allocate registers : Take out interference graph from info of program and do register allocation.
 (define (allocate-registers p)
   (match p
-    [(X86Program info blocks)
-     (let*
-         ([allocation (color-graph (dict-ref info 'conflicts) (dict-ref info 'locals-types))]
-          [info-root
-           (dict-set
-            info
-            'num-root-spills
-            (max (- (+ 5 (apply min (map (lambda (x) (cdr x)) allocation)))) 0))]
-          [info-stack
-           (dict-set
-            info-root
-            'num-stack-spills
-            (max (- (apply max (map (lambda (x) (cdr x)) allocation)) 11) 0))])
-       (X86Program info-stack (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]))
+    [(ProgramDefs info defs)
+     (ProgramDefs
+      info
+      (map
+       (lambda (def)
+         (match def
+           [(Def name params rty info blocks)
+            (let*
+                ([allocation (color-graph (dict-ref info 'conflicts) (dict-ref info 'locals-types))]
+                 [info-root
+                  (dict-set
+                   info
+                   'num-root-spills
+                   (max (- (+ 5 (apply min (map (lambda (x) (cdr x)) allocation)))) 0))]
+                 [info-stack
+                  (dict-set
+                   info-root
+                   'num-stack-spills
+                   (max (- (apply max (map (lambda (x) (cdr x)) allocation)) 11) 0))])
+              (Def name params rty info-stack (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]
+           ))
+       defs))]))
 
-(define (patch-instrs-list instrs)
+(define is-tail-jmp #f)
+
+(define (patch-instrs-list instrs name)
   (match instrs
     ['() '()]
     [(list (Instr 'movq (list a b)) more ...)
      #:when (equal? a b)
-     (patch-instrs-list more)]
+     (patch-instrs-list more name)]
     [(list (Instr op (list a b)) more ...)
      #:when (and (Deref? a) (Deref? b))
      (append
       (list (Instr 'movq (list a (Reg 'rax))))
       (list (Instr op (list (Reg 'rax) b)))
-      (patch-instrs-list more))]
+      (patch-instrs-list more name))]
     [(list (Instr 'cmpq (list a (Imm b))) more ...)
      (append
       (list (Instr 'movq (list (Imm b) (Reg 'rax))))
       (list (Instr 'cmpq (list a (Reg 'rax))))
-      (patch-instrs-list more))]
+      (patch-instrs-list more name))]
     [(list (Instr 'movzbq (list a (Deref b num))) more ...)
      (append
       (list (Instr 'movzbq (list a (Reg 'rax))))
       (list (Instr 'movq (list (Reg 'rax) (Deref b num))))
-      (patch-instrs-list more))]
+      (patch-instrs-list more name))]
+    [(list (Instr 'leaq (list a (Deref b num))) more ...)
+      (append
+       (list (Instr 'leaq (list a (Reg 'rax))))
+       (list (Instr 'movq (list (Reg 'rax) (Deref b num))))
+       (patch-instrs-list more name))]
+    [(list (TailJmp target arity) more ...)
+      (set! is-tail-jmp #t)
+      (append
+       (list (Instr 'movq (list target (Reg 'rax))))
+       (list (Jmp (create-conclude-block-label name)))
+       (patch-instrs-list more name))]
     [(list instr more ...)
      (cons
       instr
-      (patch-instrs-list more))]))
+      (patch-instrs-list more name))]))
 
-(define (patch-instructions-blocks label-block-lst)
+(define (patch-instructions-blocks label-block-lst name)
   (for/list ([label-block label-block-lst])
     (match label-block
       [(cons label block)
        (match block
          [(Block blkinfo instrs)
-          (cons label (Block blkinfo (patch-instrs-list instrs)))])])))
+          (cons label (Block blkinfo (patch-instrs-list instrs name)))])])))
 
 ;; patch-instructions : psuedo-x86 -> x86
 (define (patch-instructions p)
   (match p
-    [(X86Program info label-block-lst)
-     (X86Program info (patch-instructions-blocks label-block-lst))]))
+    [(ProgramDefs info defs)
+     (ProgramDefs
+      info
+      (map
+       (lambda (def)
+         (set! is-tail-jmp #f)
+         (match def
+           [(Def name params rty info blocks)
+            (let ([new-blocks (patch-instructions-blocks blocks name)])
+              (Def name params rty (dict-set info 'tailjmp? is-tail-jmp) new-blocks))]))
+       defs))]))
 
 
-(define register-save-area 1)
+(define (initialize-root-stack name)
+  (if (eq? name 'main)
+      (list (Instr 'movq (list (Imm 16384) (Reg 'rdi)))
+            (Instr 'movq (list (Imm 16384) (Reg 'rsi)))
+            (Callq 'initialize 2)
+            (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15))))
+      '()))
 
-(define (generate-prelude stack-spills root-spills)
-  (list (cons 'main (Block '()
-                           (list (Instr 'pushq (list (Reg 'rbp)))
-                                 (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                                 (Instr 'subq (list (Imm (align (* 8 (+ stack-spills register-save-area)) 16)) (Reg 'rsp)))
-                                 (Instr 'movq (list (Imm 16384) (Reg 'rdi)))
-                                 (Instr 'movq (list (Imm 16384) (Reg 'rsi)))
-                                 (Callq 'initialize 2)
-                                 (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15)))
-                                 (Instr 'movq (list (Imm 0) (Deref 'r15 0)))
-                                 (Instr 'addq (list (Imm (align (* 8 root-spills) 16)) (Reg 'r15)))
-                                 (Jmp 'start))))))
-
-(define (generate-conclusion stack-spills root-spills)
+(define (generate-prelude stack-spills root-spills name)
   (list (cons
-         'conclusion
+         name
          (Block '()
-                (list (Instr 'addq (list (Imm (align (* 8 (+ stack-spills register-save-area)) 16)) (Reg 'rsp)))
+                (append
+                 (list (Instr 'pushq (list (Reg 'rbp)))
+                       (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
+                       (Instr 'pushq (list (Reg 'rbx)))
+                       (Instr 'pushq (list (Reg 'r12)))
+                       (Instr 'pushq (list (Reg 'r13)))
+                       (Instr 'pushq (list (Reg 'r14)))
+                       (Instr 'subq (list (Imm (align (* 8 stack-spills) 16)) (Reg 'rsp))))
+                 (initialize-root-stack name)
+                 (list (Instr 'movq (list (Imm 0) (Deref 'r15 0)))
+                       (Instr 'addq (list (Imm (align (* 8 root-spills) 16)) (Reg 'r15)))
+                       (Jmp (create-start-block-label name))))))))
+
+(define (generate-conclusion stack-spills root-spills name tailjmp?)
+  (list (cons
+         (create-conclude-block-label name)
+         (Block '()
+                (list (Instr 'addq (list (Imm (align (* 8 stack-spills) 16)) (Reg 'rsp)))
+                      (Instr 'popq (list (Reg 'rbx)))
+                      (Instr 'popq (list (Reg 'r12)))
+                      (Instr 'popq (list (Reg 'r13)))
+                      (Instr 'popq (list (Reg 'r14)))
                       (Instr 'subq (list (Imm (align (* 8 root-spills) 16)) (Reg 'r15)))
                       (Instr 'popq (list (Reg 'rbp)))
-                      (Retq))))))
+                      (if (eq? tailjmp? #t)
+                          (IndirectJmp (Reg 'rax))
+                          (Retq)))))))
 
 ;; prelude-and-conclusion : x86 -> x86
 (define (prelude-and-conclusion p)
   (match p
-    [(X86Program info blocks)
-     (X86Program info (append (generate-prelude
-                               (dict-ref info 'num-stack-spills)
-                               (dict-ref info 'num-root-spills))
-                              blocks
-                              (generate-conclusion
-                               (dict-ref info 'num-stack-spills)
-                               (dict-ref info 'num-root-spills))
-                              ))]))
+    [(ProgramDefs info defs)
+     (ProgramDefs
+      info
+      (map
+       (lambda (def)
+         (match def
+           [(Def name params rty info blocks)
+            (Def name params rty info
+                 (append (generate-prelude
+                          (dict-ref info 'num-stack-spills)
+                          (dict-ref info 'num-root-spills)
+                          name)
+                         blocks
+                         (generate-conclusion
+                          (dict-ref info 'num-stack-spills)
+                          (dict-ref info 'num-root-spills)
+                          name
+                          (dict-ref info 'tailjmp?))
+                         ))]))
+       defs))]))
+
+(define (unroll-defs p)
+  (match p
+    [(ProgramDefs info defs)
+     (X86Program info
+                 (apply append
+                        (map
+                         (lambda (def)
+                           (match def
+                             [(Def name params rty info blocks) blocks])) defs)))]))
 
 ;; Define the compiler passes to be used by interp-tests and the grader
 ;; Note that your compiler file (the file that defines the passes)
@@ -1470,8 +1586,9 @@
     ("explicate control" ,explicate-control ,interp-Cfun ,type-check-Cfun)
     ("instruction selection" ,select-instructions #f)
     ("uncover live" ,uncover-live #f)
-    ; ("build interference graph" ,build-interference #f)
-    ; ("allocate registers" ,allocate-registers #f)
-    ; ("patch instructions" ,patch-instructions #f)
-    ; ("prelude-and-conclusion" ,prelude-and-conclusion #f)
+    ("build interference graph" ,build-interference #f)
+    ("allocate registers" ,allocate-registers #f)
+    ("patch instructions" ,patch-instructions #f)
+    ("prelude-and-conclusion" ,prelude-and-conclusion #f)
+    ("unroll defs" ,unroll-defs #f)
     ))
